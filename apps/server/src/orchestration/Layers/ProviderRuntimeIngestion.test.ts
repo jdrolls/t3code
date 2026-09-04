@@ -3726,6 +3726,158 @@ describe("ProviderRuntimeIngestion", () => {
     });
   });
 
+  it("persists Dora's validated metadata session id and carries it through later lifecycle updates", async () => {
+    const harness = await createHarness();
+    const threadId = asThreadId("thread-1");
+    const metadataAt = "2026-04-20T00:00:00.000Z";
+
+    await harness.dispatch({
+      type: "thread.session.set",
+      commandId: CommandId.make("cmd-session-seed-dora-provider-session"),
+      threadId,
+      session: {
+        threadId,
+        status: "ready",
+        providerName: "dora",
+        providerInstanceId: ProviderInstanceId.make("dora"),
+        runtimeMode: "approval-required",
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: metadataAt,
+      },
+      createdAt: metadataAt,
+    });
+
+    harness.emit({
+      type: "thread.metadata.updated",
+      eventId: asEventId("evt-dora-provider-session-metadata"),
+      provider: ProviderDriverKind.make("dora"),
+      providerInstanceId: ProviderInstanceId.make("dora"),
+      threadId,
+      createdAt: metadataAt,
+      payload: {
+        metadata: {
+          doraSessionId: "dora-session_123:resume",
+          threadId: "generic-metadata-thread-id-must-not-be-used",
+        },
+      },
+    });
+
+    let thread = await waitForThread(
+      harness.readModel,
+      (entry) => entry.session?.providerSessionId === "dora-session_123:resume",
+    );
+    expect(thread.session?.providerSessionId).toBe("dora-session_123:resume");
+
+    harness.emit({
+      type: "session.state.changed",
+      eventId: asEventId("evt-dora-provider-session-ready"),
+      provider: ProviderDriverKind.make("dora"),
+      providerInstanceId: ProviderInstanceId.make("dora"),
+      threadId,
+      createdAt: "2026-04-20T00:00:01.000Z",
+      payload: { state: "ready" },
+    });
+
+    thread = await waitForThread(
+      harness.readModel,
+      (entry) =>
+        entry.session?.status === "ready" &&
+        entry.session.providerSessionId === "dora-session_123:resume",
+    );
+    expect(thread.session?.providerSessionId).toBe("dora-session_123:resume");
+  });
+
+  it("does not accept Dora metadata without an event provider instance id", async () => {
+    const harness = await createHarness();
+    const threadId = asThreadId("thread-1");
+    const now = "2026-04-20T00:00:00.000Z";
+
+    await harness.dispatch({
+      type: "thread.session.set",
+      commandId: CommandId.make("cmd-session-seed-dora-missing-event-instance"),
+      threadId,
+      session: {
+        threadId,
+        status: "ready",
+        providerName: "dora",
+        providerInstanceId: ProviderInstanceId.make("dora"),
+        runtimeMode: "approval-required",
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: now,
+      },
+      createdAt: now,
+    });
+
+    harness.emit({
+      type: "thread.metadata.updated",
+      eventId: asEventId("evt-dora-metadata-missing-event-instance"),
+      provider: ProviderDriverKind.make("dora"),
+      threadId,
+      createdAt: now,
+      payload: { metadata: { doraSessionId: "dora-session-without-event-instance" } },
+    });
+
+    await harness.drain();
+    const thread = (await harness.readModel()).threads.find((entry) => entry.id === threadId);
+    expect(thread?.session?.providerSessionId).toBeUndefined();
+  });
+
+  it("does not derive a provider session id from missing, malformed, or non-Dora metadata", async () => {
+    const harness = await createHarness();
+    const threadId = asThreadId("thread-1");
+    const now = "2026-04-20T00:00:00.000Z";
+
+    await harness.dispatch({
+      type: "thread.session.set",
+      commandId: CommandId.make("cmd-session-seed-dora-without-provider-session"),
+      threadId,
+      session: {
+        threadId,
+        status: "ready",
+        providerName: "dora",
+        providerInstanceId: ProviderInstanceId.make("dora"),
+        runtimeMode: "approval-required",
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: now,
+      },
+      createdAt: now,
+    });
+
+    const invalidMetadata = [
+      undefined,
+      { doraSessionId: " session-with-whitespace" },
+      { doraSessionId: String(threadId) },
+      { doraSessionId: `t3-${threadId}` },
+      { doraSessionId: 42 },
+    ] as const;
+    for (const [index, metadata] of invalidMetadata.entries()) {
+      harness.emit({
+        type: "thread.metadata.updated",
+        eventId: asEventId(`evt-dora-invalid-provider-session-${index}`),
+        provider: ProviderDriverKind.make("dora"),
+        providerInstanceId: ProviderInstanceId.make("dora"),
+        threadId,
+        createdAt: now,
+        payload: metadata === undefined ? {} : { metadata },
+      });
+    }
+    harness.emit({
+      type: "thread.metadata.updated",
+      eventId: asEventId("evt-codex-generic-provider-session"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId,
+      createdAt: now,
+      payload: { metadata: { doraSessionId: "codex-session-id" } },
+    });
+
+    await harness.drain();
+    const thread = (await harness.readModel()).threads.find((entry) => entry.id === threadId);
+    expect(thread?.session?.providerSessionId).toBeUndefined();
+  });
+
   it("continues processing runtime events after a single event handler failure", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";

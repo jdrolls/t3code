@@ -136,6 +136,49 @@ function sameId(left: string | null | undefined, right: string | null | undefine
   return left === right;
 }
 
+const DORA_PROVIDER_SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+const DORA_PROVIDER_SESSION_ID_MAX_CHARS = 512;
+
+/**
+ * Dora is the sole current producer of this field. Its metadata payload is
+ * intentionally untyped, so accept only a bounded opaque identifier from the
+ * active Dora session; never promote the T3 thread id or the create-request's
+ * provisional `t3-<threadId>` binding.
+ */
+function validatedDoraProviderSessionIdFromMetadata(
+  event: ProviderRuntimeEvent,
+  session: OrchestrationThread["session"],
+): string | undefined {
+  if (
+    event.type !== "thread.metadata.updated" ||
+    event.provider !== "dora" ||
+    session?.providerName !== "dora"
+  ) {
+    return undefined;
+  }
+  if (
+    event.providerInstanceId === undefined ||
+    session.providerInstanceId === undefined ||
+    event.providerInstanceId !== session.providerInstanceId
+  ) {
+    return undefined;
+  }
+
+  const value = event.payload.metadata?.doraSessionId;
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > DORA_PROVIDER_SESSION_ID_MAX_CHARS ||
+    value.trim() !== value ||
+    !DORA_PROVIDER_SESSION_ID_PATTERN.test(value) ||
+    value === event.threadId ||
+    value === `t3-${event.threadId}`
+  ) {
+    return undefined;
+  }
+  return value;
+}
+
 function hasAssistantMessageForTurn(
   messages: ReadonlyArray<OrchestrationMessage>,
   turnId: TurnId,
@@ -1730,6 +1773,9 @@ const make = Effect.gen(function* () {
               ...(event.providerInstanceId !== undefined
                 ? { providerInstanceId: event.providerInstanceId }
                 : {}),
+              ...(thread.session?.providerSessionId !== undefined
+                ? { providerSessionId: thread.session.providerSessionId }
+                : {}),
               runtimeMode: thread.session?.runtimeMode ?? "full-access",
               activeTurnId: nextActiveTurnId,
               lastError,
@@ -1981,6 +2027,9 @@ const make = Effect.gen(function* () {
               ...(event.providerInstanceId !== undefined
                 ? { providerInstanceId: event.providerInstanceId }
                 : {}),
+              ...(thread.session?.providerSessionId !== undefined
+                ? { providerSessionId: thread.session.providerSessionId }
+                : {}),
               runtimeMode: thread.session?.runtimeMode ?? "full-access",
               activeTurnId: eventTurnId ?? null,
               lastError: runtimeErrorMessage,
@@ -1989,6 +2038,39 @@ const make = Effect.gen(function* () {
             createdAt: now,
           });
         }
+      }
+
+      const doraProviderSessionId = validatedDoraProviderSessionIdFromMetadata(
+        event,
+        thread.session,
+      );
+      if (
+        doraProviderSessionId !== undefined &&
+        doraProviderSessionId !== thread.session?.providerSessionId &&
+        thread.session !== null
+      ) {
+        // Dora alone supplies this durable provider-side identity, and only
+        // after the event is bound to the active Dora instance. Never derive
+        // it from generic metadata or the canonical T3 thread id.
+        yield* orchestrationEngine.dispatch({
+          type: "thread.session.set",
+          commandId: yield* providerCommandId(event, "dora-provider-session-set"),
+          threadId: thread.id,
+          session: {
+            threadId: thread.id,
+            status: thread.session.status,
+            providerName: thread.session.providerName,
+            ...(thread.session.providerInstanceId !== undefined
+              ? { providerInstanceId: thread.session.providerInstanceId }
+              : {}),
+            providerSessionId: doraProviderSessionId,
+            runtimeMode: thread.session.runtimeMode,
+            activeTurnId: thread.session.activeTurnId,
+            lastError: thread.session.lastError,
+            updatedAt: now,
+          },
+          createdAt: now,
+        });
       }
 
       if (event.type === "thread.metadata.updated" && event.payload.name) {

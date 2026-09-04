@@ -950,17 +950,46 @@ it.effect("decodes orchestration session runtime mode defaults", () =>
       threadId: "thread-1",
       status: "idle",
       providerName: null,
-      providerSessionId: null,
-      providerThreadId: null,
       activeTurnId: null,
       lastError: null,
       updatedAt: "2026-01-01T00:00:00.000Z",
     });
     assert.strictEqual(parsed.runtimeMode, DEFAULT_RUNTIME_MODE);
+    assert.strictEqual(parsed.providerSessionId, undefined);
   }),
 );
 
-it.effect("defaults proposed plan implementation metadata for historical rows", () =>
+it.effect("accepts only bounded opaque provider session ids", () =>
+  Effect.gen(function* () {
+    const valid = yield* decodeOrchestrationSession({
+      threadId: "thread-1",
+      status: "ready",
+      providerName: "dora",
+      providerSessionId: "dora-session_1:resume",
+      runtimeMode: "full-access",
+      activeTurnId: null,
+      lastError: null,
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    assert.strictEqual(valid.providerSessionId, "dora-session_1:resume");
+
+    const malformed = yield* Effect.exit(
+      decodeOrchestrationSession({
+        threadId: "thread-1",
+        status: "ready",
+        providerName: "dora",
+        providerSessionId: "not a session id",
+        runtimeMode: "full-access",
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      }),
+    );
+    assert.strictEqual(malformed._tag, "Failure");
+  }),
+);
+
+it.effect("defaults proposed plan implementation metadata for historical rows",  () =>
   Effect.gen(function* () {
     const parsed = yield* decodeOrchestrationProposedPlan({
       id: "plan-1",

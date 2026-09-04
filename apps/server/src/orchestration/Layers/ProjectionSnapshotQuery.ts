@@ -333,6 +333,7 @@ function mapSessionRow(
     status: row.status,
     providerName: row.providerName,
     ...(row.providerInstanceId !== null ? { providerInstanceId: row.providerInstanceId } : {}),
+    ...(row.providerSessionId !== null ? { providerSessionId: row.providerSessionId } : {}),
     runtimeMode: row.runtimeMode,
     activeTurnId: row.activeTurnId,
     lastError: row.lastError,
@@ -649,7 +650,6 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           provider_name AS "providerName",
           provider_instance_id AS "providerInstanceId",
           provider_session_id AS "providerSessionId",
-          provider_thread_id AS "providerThreadId",
           runtime_mode AS "runtimeMode",
           active_turn_id AS "activeTurnId",
           last_error AS "lastError",
@@ -670,7 +670,6 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           sessions.provider_name AS "providerName",
           sessions.provider_instance_id AS "providerInstanceId",
           sessions.provider_session_id AS "providerSessionId",
-          sessions.provider_thread_id AS "providerThreadId",
           sessions.runtime_mode AS "runtimeMode",
           sessions.active_turn_id AS "activeTurnId",
           sessions.last_error AS "lastError",
@@ -695,7 +694,6 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           sessions.provider_name AS "providerName",
           sessions.provider_instance_id AS "providerInstanceId",
           sessions.provider_session_id AS "providerSessionId",
-          sessions.provider_thread_id AS "providerThreadId",
           sessions.runtime_mode AS "runtimeMode",
           sessions.active_turn_id AS "activeTurnId",
           sessions.last_error AS "lastError",
@@ -1244,6 +1242,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           status,
           provider_name AS "providerName",
           provider_instance_id AS "providerInstanceId",
+          provider_session_id AS "providerSessionId",
           runtime_mode AS "runtimeMode",
           active_turn_id AS "activeTurnId",
           last_error AS "lastError",
@@ -1904,6 +1903,9 @@ pending_approval_requests AS (
                   providerName: row.providerName,
                   ...(row.providerInstanceId !== null
                     ? { providerInstanceId: row.providerInstanceId }
+                    : {}),
+                  ...(row.providerSessionId !== null
+                    ? { providerSessionId: row.providerSessionId }
                     : {}),
                   runtimeMode: row.runtimeMode,
                   activeTurnId: row.activeTurnId,

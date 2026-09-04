@@ -2334,6 +2334,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
                 "claudeAgent",
                 "codex",
                 "cursor",
+                "dora",
                 "grok",
                 "opencode",
               ]);

@@ -395,11 +395,24 @@ export const OrchestrationSessionStatus = Schema.Literals([
 ]);
 export type OrchestrationSessionStatus = typeof OrchestrationSessionStatus.Type;
 
+/**
+ * Opaque provider-side session identity safe to expose in authenticated
+ * orchestration snapshots. Deliberately excludes whitespace, controls, and
+ * URL/query delimiters so adapters cannot persist arbitrary metadata here.
+ */
+export const ProviderSessionId = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(512),
+  Schema.isPattern(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/),
+);
+export type ProviderSessionId = typeof ProviderSessionId.Type;
+
 export const OrchestrationSession = Schema.Struct({
   threadId: ThreadId,
   status: OrchestrationSessionStatus,
   providerName: Schema.NullOr(TrimmedNonEmptyString),
   providerInstanceId: Schema.optional(ProviderInstanceId),
+  // Absent for providers that do not expose a durable provider-side session.
+  providerSessionId: Schema.optional(ProviderSessionId),
   runtimeMode: RuntimeMode.pipe(Schema.withDecodingDefault(Effect.succeed(DEFAULT_RUNTIME_MODE))),
   activeTurnId: Schema.NullOr(TurnId),
   lastError: Schema.NullOr(TrimmedNonEmptyString),
