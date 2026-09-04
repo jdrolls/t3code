@@ -12,11 +12,11 @@ import packageJson from "./package.json" with { type: "json" };
 // support 20 native binaries. NSIS install time tracks file count, not bytes.
 //
 // Inverted here — bundle everything except the packages that genuinely cannot be
-// inlined. See scripts/lib/cli-external-packages.ts for what earns an exemption.
+// inlined. See scripts/lib/cli-external-packages.mjs for what earns an exemption.
 import {
   isExternalCliDependency,
   shouldBundleCliDependency,
-} from "../../scripts/lib/cli-external-packages.ts";
+} from "../../scripts/lib/cli-external-packages.mjs";
 
 export { shouldBundleCliDependency };
 

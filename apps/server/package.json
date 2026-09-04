@@ -1,10 +1,10 @@
 {
   "name": "t3",
-  "version": "0.0.38",
+  "version": "0.0.39",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/pingdotgg/t3code",
+    "url": "https://github.com/jdrolls/t3code",
     "directory": "apps/server"
   },
   "bin": {
