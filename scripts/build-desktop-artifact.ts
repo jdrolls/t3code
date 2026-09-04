@@ -31,7 +31,7 @@ import { getDefaultBuildArch } from "./lib/build-target-arch.ts";
 import {
   findInlinedExternalPackages,
   selectCliRuntimeExternalDependencies,
-} from "./lib/cli-external-packages.ts";
+} from "./lib/cli-external-packages.mjs";
 import { loadRepoEnv } from "./lib/public-config.ts";
 import { resolveCatalogDependencies } from "./lib/resolve-catalog.ts";
 
@@ -605,7 +605,7 @@ export class InlinedNativePackageError extends Schema.TaggedErrorClass<InlinedNa
   { packages: Schema.Array(Schema.String) },
 ) {
   override get message(): string {
-    return `The server bundle inlined packages that load native binaries: ${this.packages.join(", ")}. A node-gyp-build style loader resolves prebuilds relative to its own file, so inlined into a chunk it finds none and the importer quietly falls back to a slower JS path. Add them to CLI_RUNTIME_EXTERNAL_PREFIXES in scripts/lib/cli-external-packages.ts so they stay external and are staged in the sidecar.`;
+    return `The server bundle inlined packages that load native binaries: ${this.packages.join(", ")}. A node-gyp-build style loader resolves prebuilds relative to its own file, so inlined into a chunk it finds none and the importer quietly falls back to a slower JS path. Add them to CLI_RUNTIME_EXTERNAL_PREFIXES in scripts/lib/cli-external-packages.mjs so they stay external and are staged in the sidecar.`;
   }
 }
 

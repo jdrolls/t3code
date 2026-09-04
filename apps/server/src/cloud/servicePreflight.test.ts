@@ -1,7 +1,15 @@
 import { expect, it } from "@effect/vitest";
 
+import {
+  SERVICE_LAUNCHER_PROTOCOL as NODE_SERVICE_LAUNCHER_PROTOCOL,
+} from "../../../../scripts/lib/service-launcher-protocol.mjs";
+
 import { runServicePreflight } from "./servicePreflight.ts";
 import { SERVICE_LAUNCHER_PROTOCOL } from "./serviceProtocol.ts";
+
+it("shares the launcher protocol with Node release tooling", () => {
+  expect(SERVICE_LAUNCHER_PROTOCOL).toBe(NODE_SERVICE_LAUNCHER_PROTOCOL);
+});
 
 it("requires the database-snapshot launcher protocol", () => {
   expect(

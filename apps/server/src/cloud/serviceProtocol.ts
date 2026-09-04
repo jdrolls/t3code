@@ -1,7 +1,8 @@
 import type { ServerSelfUpdateOutcome } from "@t3tools/contracts";
 
-/** Protocol 2 snapshots SQLite before trials so migrations can be rolled back safely. */
-export const SERVICE_LAUNCHER_PROTOCOL = 2 as const;
+import { SERVICE_LAUNCHER_PROTOCOL } from "../../../../scripts/lib/service-launcher-protocol.mjs";
+
+export { SERVICE_LAUNCHER_PROTOCOL } from "../../../../scripts/lib/service-launcher-protocol.mjs";
 export const SERVICE_LAUNCHER_CONTEXT_ENV = "T3_SERVICE_LAUNCHER_CONTEXT";
 export const SERVICE_LAUNCHER_FILE = "service-launcher.mjs";
 export const SERVICE_STATE_FILE = "service-state.json";

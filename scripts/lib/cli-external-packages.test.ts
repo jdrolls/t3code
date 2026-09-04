@@ -14,7 +14,7 @@ import {
   findInlinedExternalPackages,
   selectCliRuntimeExternalDependencies,
   shouldBundleCliDependency,
-} from "./cli-external-packages.ts";
+} from "./cli-external-packages.mjs";
 
 // Only the field this test cares about; decoding ignores everything else.
 // optionalDependencies matter as much as dependencies here: every native family

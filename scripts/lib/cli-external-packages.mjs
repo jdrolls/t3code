@@ -1,15 +1,18 @@
 /**
  * The single source of truth for packages the server CLI bundle must NOT inline.
  *
- * Two consumers derive from this list, and they must never disagree:
+ * Three consumers derive from this list, and they must never disagree:
  *
  * - apps/server/vite.config.ts decides what stays external to the bundle.
  * - scripts/build-desktop-artifact.ts selects the runtime dependency roots for
  *   the Windows server sidecar.
+ * - scripts/stage-t3-runtime.mjs selects the runtime dependency roots for the
+ *   standalone Node runtime.
  *
- * A runtime package that is external but absent from the sidecar fails as soon
- * as Node resolves it from the emitted bundle. Keeping both consumers on one
- * list prevents packaging from drifting away from the bundle boundary.
+ * A runtime package that is external but absent from a staged runtime fails as
+ * soon as Node resolves it from the emitted bundle. Keeping all consumers on
+ * one Node-loadable list prevents packaging from drifting from the bundle
+ * boundary.
  *
  * Entries are matched as prefixes (`id.startsWith(prefix)`), so they also cover
  * a package's platform-specific siblings — `node-gyp-build` covers
@@ -48,7 +51,7 @@ export const CLI_RUNTIME_EXTERNAL_PREFIXES = [
   // becoming real if either is ever declared as a dependency.
   "bufferutil",
   "utf-8-validate",
-] as const;
+];
 
 /**
  * External only so the bundler never has to resolve them.
@@ -61,14 +64,14 @@ export const CLI_RUNTIME_EXTERNAL_PREFIXES = [
 export const CLI_BUILD_ONLY_EXTERNAL_PREFIXES = [
   "@effect/platform-bun",
   "@effect/sql-sqlite-bun",
-] as const;
+];
 
 export const CLI_EXTERNAL_PACKAGE_PREFIXES = [
   ...CLI_RUNTIME_EXTERNAL_PREFIXES,
   ...CLI_BUILD_ONLY_EXTERNAL_PREFIXES,
-] as const;
+];
 
-export function isRuntimeExternalCliDependency(id: string): boolean {
+export function isRuntimeExternalCliDependency(id) {
   return CLI_RUNTIME_EXTERNAL_PREFIXES.some((prefix) => id.startsWith(prefix));
 }
 
@@ -82,20 +85,18 @@ export function isRuntimeExternalCliDependency(id: string): boolean {
  * msgpackr-extract, node-gyp-build-optional-packages and detect-libc ended up
  * inlined while node-pty (a declared dependency) stayed external.
  */
-export function isExternalCliDependency(id: string): boolean {
+export function isExternalCliDependency(id) {
   return CLI_EXTERNAL_PACKAGE_PREFIXES.some((prefix) => id.startsWith(prefix));
 }
 
 /** True when the CLI bundle should inline `id` rather than leave it external. */
-export function shouldBundleCliDependency(id: string): boolean {
+export function shouldBundleCliDependency(id) {
   if (id.startsWith("node:")) return false;
   return !isExternalCliDependency(id);
 }
 
 /** Select direct dependency roots whose runtime closure belongs in the sidecar. */
-export function selectCliRuntimeExternalDependencies(
-  dependencies: Readonly<Record<string, string>>,
-): Record<string, string> {
+export function selectCliRuntimeExternalDependencies(dependencies) {
   return Object.fromEntries(
     Object.entries(dependencies).filter(([name]) => isRuntimeExternalCliDependency(name)),
   );
@@ -121,18 +122,14 @@ export function selectCliRuntimeExternalDependencies(
  * backends would then fail with ERR_MODULE_NOT_FOUND because those packages
  * are not in the selected sidecar closure either.
  */
-export function findInlinedExternalPackages(source: string): {
-  readonly regionCount: number;
-  readonly inlined: ReadonlyArray<string>;
-  readonly inlinedPackages: ReadonlyArray<string>;
-} {
+export function findInlinedExternalPackages(source) {
   // Rolldown marks each inlined module with a `//#region <path>` comment.
   const regionPattern = /\/\/#region\s+(\S+)/g;
   const packagePattern = /node_modules\/((?:@[^/\s]+\/)?[^/\s]+)\//g;
 
   let regionCount = 0;
-  const inlined = new Set<string>();
-  const inlinedPackages = new Set<string>();
+  const inlined = new Set();
+  const inlinedPackages = new Set();
   for (const region of source.matchAll(regionPattern)) {
     regionCount += 1;
     const regionPath = region[1] ?? "";
