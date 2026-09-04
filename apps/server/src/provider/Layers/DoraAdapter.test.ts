@@ -110,9 +110,9 @@ function acknowledgeRequest(process: FakeDoraJsonlProcess, request: DoraRequest)
   if (request.op === "session.create" || request.op === "session.resume") {
     const binding =
       request.op === "session.create"
-        ? { ...request.binding, sessionId: `dora-session-${request.binding.threadId}` }
+        ? { ...request.binding, sessionId: "acp-minted-session" }
         : request.binding;
-    process.emit({ ...makeEvent(request, request.op === "session.create" ? "session.started" : "session.resumed"), binding });
+    process.emit({ ...makeEvent(request, request.op === "session.create" ? "session.started" : "session.resumed", undefined, { requestId: request.requestId }), binding });
     process.emit({ ...makeEvent(request, "receipt", undefined, { requestId: request.requestId }), binding });
   } else if (request.op === "turn") {
     process.emit(makeEvent(request, "receipt", undefined, { requestId: request.requestId }));
@@ -169,6 +169,13 @@ describe("DoraAdapter", () => {
       );
       assert.isTrue(containsDoraSecret({ Authorization: "anything" }));
       assert.throws(() => decodeDoraEvent({ protocolVersion: 1, type: "receipt" }));
+      assert.throws(() =>
+        decodeDoraEvent({
+          protocolVersion: 1,
+          type: "session.started",
+          binding: { provider: "dora", providerInstanceId: "dora", threadId: "thread", worktree: "/tmp", sessionId: "acp-session" },
+        }),
+      );
       assert.throws(() =>
         decodeDoraEvent({
           protocolVersion: 1,
@@ -242,6 +249,32 @@ describe("DoraAdapter", () => {
     }),
   );
 
+  it.effect("publishes handshake and inline start-session events in source order", () =>
+    Effect.gen(function* () {
+      const harness = makeHarness();
+      const adapter = yield* harness.adapter;
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const sessionStarted = yield* Deferred.make<void>();
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          runtimeEvents.push(event);
+          if (event.type === "session.started") {
+            yield* Deferred.succeed(sessionStarted, undefined).pipe(Effect.ignore);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* start(adapter);
+      yield* Deferred.await(sessionStarted);
+      assert.deepEqual(runtimeEvents.map((event) => event.type), [
+        "thread.started",
+        "thread.metadata.updated",
+        "session.started",
+      ]);
+      yield* Fiber.interrupt(eventsFiber);
+    }),
+  );
+
   it.effect("binds every operation to the canonical thread, worktree, instance, and Dora session", () =>
     Effect.gen(function* () {
       const harness = makeHarness();
@@ -265,7 +298,7 @@ describe("DoraAdapter", () => {
 
       const session = yield* start(adapter);
       const canonicalWorktree = session.cwd;
-      assert.deepEqual(session.resumeCursor, { schemaVersion: 1, sessionId: `dora-session-${String(THREAD_ID)}` });
+      assert.deepEqual(session.resumeCursor, { schemaVersion: 1, sessionId: "acp-minted-session" });
       const turn = yield* adapter.sendTurn({ threadId: THREAD_ID, input: "inspect", attachments: [] });
       const turnRequest = harness.process.writes.at(-1);
       assert.isDefined(turnRequest);
@@ -298,7 +331,7 @@ describe("DoraAdapter", () => {
         assert.equal(request.binding.worktree, canonicalWorktree);
         assert.equal(
           request.binding.sessionId,
-          index === 0 ? `t3-${String(THREAD_ID)}` : `dora-session-${String(THREAD_ID)}`,
+          index === 0 ? `t3-${String(THREAD_ID)}` : "acp-minted-session",
         );
       }
       assert.include(runtimeEvents.map((event) => event.type), "request.opened");
@@ -338,6 +371,137 @@ describe("DoraAdapter", () => {
       yield* Deferred.await(runtimeFailure);
       assert.equal(yield* adapter.hasSession(THREAD_ID), false);
       assert.equal(harness.process.closeCalls, 1);
+      yield* Fiber.interrupt(eventsFiber);
+    }),
+  );
+
+  it.effect("rejects uncorrelated or provisional session handshakes", () =>
+    Effect.gen(function* () {
+      const settings = decodeDoraSettings({ binaryPath: "dora-test", requestTimeoutMs: 1_000 });
+      const wrongRequestProcess = new FakeDoraJsonlProcess();
+      wrongRequestProcess.onWrite = (request) => {
+        wrongRequestProcess.emit({
+          ...makeEvent(request, "session.started", undefined, { requestId: "other-request" }),
+          binding: { ...request.binding, sessionId: "acp-session" },
+        });
+      };
+      const wrongRequestAdapter = yield* makeDoraAdapter(settings, {
+        instanceId: INSTANCE_ID,
+        createProcess: async () => wrongRequestProcess,
+        scheduleReceiptTimeout: new FakeReceiptTimeouts().schedule,
+      });
+      const wrongRequestFailure = yield* start(wrongRequestAdapter).pipe(Effect.result);
+      assert.equal(wrongRequestFailure._tag, "Failure");
+      assert.equal(yield* wrongRequestAdapter.hasSession(THREAD_ID), false);
+
+      const provisionalProcess = new FakeDoraJsonlProcess();
+      provisionalProcess.onWrite = (request) => {
+        provisionalProcess.emit({
+          ...makeEvent(request, "session.started", undefined, { requestId: request.requestId }),
+          binding: request.binding,
+        });
+      };
+      const provisionalAdapter = yield* makeDoraAdapter(settings, {
+        instanceId: INSTANCE_ID,
+        createProcess: async () => provisionalProcess,
+        scheduleReceiptTimeout: new FakeReceiptTimeouts().schedule,
+      });
+      const provisionalFailure = yield* start(provisionalAdapter).pipe(Effect.result);
+      assert.equal(provisionalFailure._tag, "Failure");
+      assert.equal(yield* provisionalAdapter.hasSession(THREAD_ID), false);
+    }),
+  );
+
+  it.effect("fails closed on terminal-before-receipt", () =>
+    Effect.gen(function* () {
+      const harness = makeHarness();
+      const adapter = yield* harness.adapter;
+      const runtimeFailure = yield* Deferred.make<void>();
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        event.type === "runtime.error"
+          ? Deferred.succeed(runtimeFailure, undefined).pipe(Effect.ignore)
+          : Effect.void,
+      ).pipe(Effect.forkChild);
+      yield* start(adapter);
+      harness.process.onWrite = () => {};
+      const sendTurnFiber = yield* adapter
+        .sendTurn({ threadId: THREAD_ID, input: "must be receipted", attachments: [] })
+        .pipe(Effect.forkChild);
+      yield* Effect.promise(() => harness.receiptTimeouts.waitForSchedule());
+      const turnRequest = harness.process.writes.at(-1);
+      if (!turnRequest) return;
+      // Use the turn id T3 sent; the bridge cannot supply a different identity.
+      const turnId = turnRequest.payload.turnId;
+      if (typeof turnId !== "string") return;
+      harness.process.emit(makeEvent(turnRequest, "turn.completed", { state: "completed" }, { turnId }));
+      yield* Deferred.await(runtimeFailure);
+      const failure = yield* Effect.flip(Fiber.join(sendTurnFiber));
+      assert.equal(failure._tag, "ProviderAdapterRequestError");
+      assert.equal(yield* adapter.hasSession(THREAD_ID), false);
+      yield* Fiber.interrupt(eventsFiber);
+    }),
+  );
+
+  it.effect("rejects unresolved turn-scoped operations when a valid terminal event arrives", () =>
+    Effect.gen(function* () {
+      const harness = makeHarness();
+      const adapter = yield* harness.adapter;
+      const terminal = yield* Deferred.make<void>();
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        event.type === "turn.completed"
+          ? Deferred.succeed(terminal, undefined).pipe(Effect.ignore)
+          : Effect.void,
+      ).pipe(Effect.forkChild);
+      yield* start(adapter);
+      const turn = yield* adapter.sendTurn({ threadId: THREAD_ID, input: "complete with pending interrupt", attachments: [] });
+      const turnRequest = harness.process.writes.at(-1);
+      if (!turnRequest) return;
+      harness.process.onWrite = (request) => {
+        if (request.op !== "interrupt") acknowledgeRequest(harness.process, request);
+      };
+      const interruptFiber = yield* adapter.interruptTurn(THREAD_ID, turn.turnId).pipe(Effect.forkChild);
+      yield* Effect.promise(() => harness.receiptTimeouts.waitForSchedule());
+      harness.process.emit(
+        makeEvent(turnRequest, "turn.completed", { state: "completed" }, { turnId: String(turn.turnId) }),
+      );
+      yield* Deferred.await(terminal);
+      const failure = yield* Effect.flip(Fiber.join(interruptFiber));
+      assert.equal(failure._tag, "ProviderAdapterRequestError");
+      assert.instanceOf(failure.cause, Error);
+      if (failure.cause instanceof Error) {
+        assert.equal(
+          failure.cause.message,
+          "Dora turn completed while a turn-scoped operation was awaiting receipt.",
+        );
+      }
+      assert.equal(yield* adapter.hasSession(THREAD_ID), true);
+      yield* adapter.stopSession(THREAD_ID);
+      yield* Fiber.interrupt(eventsFiber);
+    }),
+  );
+
+  it.effect("fails closed on a late receipt after terminal completion", () =>
+    Effect.gen(function* () {
+      const harness = makeHarness();
+      const adapter = yield* harness.adapter;
+      const terminal = yield* Deferred.make<void>();
+      const runtimeFailure = yield* Deferred.make<void>();
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) => {
+        if (event.type === "turn.completed") return Deferred.succeed(terminal, undefined).pipe(Effect.ignore);
+        if (event.type === "runtime.error") return Deferred.succeed(runtimeFailure, undefined).pipe(Effect.ignore);
+        return Effect.void;
+      }).pipe(Effect.forkChild);
+      yield* start(adapter);
+      const turn = yield* adapter.sendTurn({ threadId: THREAD_ID, input: "complete before duplicate receipt", attachments: [] });
+      const turnRequest = harness.process.writes.at(-1);
+      if (!turnRequest) return;
+      harness.process.emit(
+        makeEvent(turnRequest, "turn.completed", { state: "completed" }, { turnId: String(turn.turnId) }),
+      );
+      yield* Deferred.await(terminal);
+      harness.process.emit(makeEvent(turnRequest, "receipt", undefined, { requestId: turnRequest.requestId }));
+      yield* Deferred.await(runtimeFailure);
+      assert.equal(yield* adapter.hasSession(THREAD_ID), false);
       yield* Fiber.interrupt(eventsFiber);
     }),
   );

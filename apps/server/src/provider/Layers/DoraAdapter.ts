@@ -121,6 +121,10 @@ export interface DoraAdapterLiveOptions {
 }
 
 interface PendingReceipt {
+  /** The operation whose acknowledgement this receipt settles. */
+  readonly op: DoraOperation;
+  /** The active turn at request issuance, when this operation belongs to one. */
+  readonly turnId: TurnId | undefined;
   readonly resolve: () => void;
   readonly reject: (cause: Error) => void;
 }
@@ -136,7 +140,14 @@ interface DoraContext {
   readonly work: DoraWorkIdentity;
   readonly providerInstanceId: ProviderInstanceId;
   session: ProviderSession;
+  /** The durable ACP session id, established by a validated handshake. */
   providerSessionId: string | undefined;
+  /** Create-only transport id; never a durable provider identity. */
+  readonly provisionalSessionId: string | undefined;
+  /** The session operation whose handshake has been validated but not receipted. */
+  sessionHandshakeRequestId: string | undefined;
+  /** A terminal event is legal only after this exact turn request was receipted. */
+  receiptedTurnId: TurnId | undefined;
   activeTurnId: TurnId | undefined;
   readonly turns: Array<{ id: TurnId; items: Array<unknown> }>;
   readonly receipts: Map<string, PendingReceipt>;
@@ -289,8 +300,14 @@ export function decodeDoraEvent(value: unknown): DoraEvent {
   const turnId = nonEmptyString(value.turnId);
   const payload = value.payload === undefined ? undefined : isRecord(value.payload) ? value.payload : undefined;
   if (value.payload !== undefined && payload === undefined) throw new Error("Dora event payload must be an object.");
-  if ((value.type === "receipt" || value.type === "failure") && !requestId) {
-    throw new Error("Dora receipt/failure event is missing requestId.");
+  if (
+    (value.type === "receipt" ||
+      value.type === "failure" ||
+      value.type === "session.started" ||
+      value.type === "session.resumed") &&
+    !requestId
+  ) {
+    throw new Error("Dora receipt, failure, and session handshake events require requestId.");
   }
   return {
     protocolVersion: PROTOCOL_VERSION,
@@ -392,7 +409,14 @@ export function makeDoraAdapter(settings: DoraSettings, options?: DoraAdapterLiv
     const sessions = new Map<ThreadId, DoraContext>();
     let counter = 0;
     const stamp = () => ({ eventId: EventId.make(`dora-${Date.now()}-${counter++}`), createdAt: new Date().toISOString() });
-    const emit = (event: ProviderRuntimeEvent) => Effect.runFork(Queue.offer(runtimeEvents, event));
+    // This is an unbounded queue, so offerUnsafe publishes inline and preserves
+    // FIFO source order across the consume loop and API continuations (notably
+    // startSession after its receipt resolves). It returns false rather than
+    // throwing once the finalizer has shut the queue down, which permits an
+    // in-flight continuation to finish teardown without reviving the queue.
+    const emit = (event: ProviderRuntimeEvent) => {
+      void Queue.offerUnsafe(runtimeEvents, event);
+    };
     const bindingFor = (ctx: DoraContext): DoraBinding => {
       if (!ctx.providerSessionId) throw new Error("Dora session has not acknowledged a provider session id.");
       return {
@@ -407,12 +431,21 @@ export function makeDoraAdapter(settings: DoraSettings, options?: DoraAdapterLiv
       const { activeTurnId: _activeTurnId, ...session } = ctx.session;
       ctx.session = { ...session, status: "ready", updatedAt: new Date().toISOString() };
       ctx.activeTurnId = undefined;
+      ctx.receiptedTurnId = undefined;
       ctx.interactions.clear();
     };
     const rejectReceipts = (ctx: DoraContext, cause: Error) => {
       for (const [requestId, pending] of ctx.receipts) {
         ctx.receipts.delete(requestId);
         pending.reject(cause);
+      }
+    };
+    const rejectTurnScopedReceipts = (ctx: DoraContext, turnId: TurnId, cause: Error) => {
+      for (const [requestId, pending] of ctx.receipts) {
+        if (pending.turnId === turnId) {
+          ctx.receipts.delete(requestId);
+          pending.reject(cause);
+        }
       }
     };
     const closeContext = (ctx: DoraContext): Promise<void> => {
@@ -442,20 +475,39 @@ export function makeDoraAdapter(settings: DoraSettings, options?: DoraAdapterLiv
         throw new Error("Dora event binding does not match the active T3 session.");
       }
       const isSessionHandshake = event.type === "session.started" || event.type === "session.resumed";
-      if (ctx.providerSessionId === undefined && !isSessionHandshake) {
-        throw new Error("Dora emitted a non-start event before binding a provider session.");
+      if (!isSessionHandshake) {
+        if (ctx.providerSessionId === undefined) {
+          throw new Error("Dora emitted a non-start event before binding a provider session.");
+        }
+        if (binding.sessionId !== ctx.providerSessionId) {
+          throw new Error("Dora event session does not match the active provider session.");
+        }
+        return;
       }
-      if (ctx.providerSessionId !== undefined && binding.sessionId !== ctx.providerSessionId) {
-        throw new Error("Dora event session does not match the active provider session.");
+
+      const expectedOp = event.type === "session.started" ? "session.create" : "session.resume";
+      const pending = event.requestId ? ctx.receipts.get(event.requestId) : undefined;
+      if (!pending || pending.op !== expectedOp || ctx.sessionHandshakeRequestId !== undefined) {
+        throw new Error("Dora session handshake is not correlated to its pending session operation.");
       }
-      if (isSessionHandshake) {
-        ctx.providerSessionId = binding.sessionId;
-        ctx.session = {
-          ...ctx.session,
-          resumeCursor: { schemaVersion: DORA_RESUME_VERSION, sessionId: binding.sessionId },
-          updatedAt: new Date().toISOString(),
-        };
+      // The bridge mints the authoritative ACP id for a create. The T3
+      // provisional id exists only to bind that outbound request and can never
+      // become the stored provider identity. A resume must instead confirm the
+      // durable ACP id from its validated cursor.
+      if (event.type === "session.started") {
+        if (binding.sessionId === ctx.provisionalSessionId || binding.sessionId === String(ctx.threadId)) {
+          throw new Error("Dora session.started reused a non-authoritative T3 session id.");
+        }
+      } else if (binding.sessionId !== ctx.providerSessionId) {
+        throw new Error("Dora session.resumed does not confirm the durable provider session id.");
       }
+      ctx.sessionHandshakeRequestId = event.requestId!;
+      ctx.providerSessionId = binding.sessionId;
+      ctx.session = {
+        ...ctx.session,
+        resumeCursor: { schemaVersion: DORA_RESUME_VERSION, sessionId: binding.sessionId },
+        updatedAt: new Date().toISOString(),
+      };
     };
     const activeTurnFor = (ctx: DoraContext, event: DoraEvent): TurnId => {
       if (!ctx.activeTurnId || event.turnId !== String(ctx.activeTurnId)) {
@@ -471,11 +523,26 @@ export function makeDoraAdapter(settings: DoraSettings, options?: DoraAdapterLiv
           validateEventBinding(ctx, event);
           if (event.type === "receipt" || event.type === "failure") {
             const pending = event.requestId ? ctx.receipts.get(event.requestId) : undefined;
-            if (!pending) throw new Error("Dora emitted a receipt for an unknown request.");
+            if (!pending) throw new Error("Dora emitted a receipt for an unknown or late request.");
+            if (
+              event.type === "receipt" &&
+              (pending.op === "session.create" || pending.op === "session.resume") &&
+              ctx.sessionHandshakeRequestId !== event.requestId
+            ) {
+              throw new Error("Dora receipted a session operation before its correlated handshake.");
+            }
             ctx.receipts.delete(event.requestId!);
-            event.type === "receipt"
-              ? pending.resolve()
-              : pending.reject(new Error(detail(event.payload, "Dora rejected request.")));
+            if (event.type === "receipt") {
+              if (pending.op === "turn") {
+                if (!pending.turnId || pending.turnId !== ctx.activeTurnId) {
+                  throw new Error("Dora receipted a turn request that is no longer active.");
+                }
+                ctx.receiptedTurnId = pending.turnId;
+              }
+              pending.resolve();
+            } else {
+              pending.reject(new Error(detail(event.payload, "Dora rejected request.")));
+            }
           }
           switch (event.type) {
             case "session.started":
@@ -525,7 +592,15 @@ export function makeDoraAdapter(settings: DoraSettings, options?: DoraAdapterLiv
             }
             case "turn.completed": {
               const turnId = activeTurnFor(ctx, event);
+              if (ctx.receiptedTurnId !== turnId) {
+                throw new Error("Dora turn.completed arrived before the matching turn receipt.");
+              }
               const payload = decodeDoraTurnCompletedPayload(event.payload);
+              rejectTurnScopedReceipts(
+                ctx,
+                turnId,
+                new Error("Dora turn completed while a turn-scoped operation was awaiting receipt."),
+              );
               restoreReady(ctx);
               emit({ ...stamp(), provider: PROVIDER, providerInstanceId: instanceId, threadId: ctx.threadId, turnId, type: "turn.completed", payload, raw: { source: "dora.jsonl", payload: raw } });
               break;
@@ -563,6 +638,8 @@ export function makeDoraAdapter(settings: DoraSettings, options?: DoraAdapterLiv
           settle(new Error("Dora protocol receipt timed out.")),
         );
         ctx.receipts.set(requestId, {
+          op,
+          turnId: ctx.activeTurnId,
           resolve: () => { cancelTimeout(); resolve(); },
           reject: (cause) => { cancelTimeout(); reject(cause); },
         });
@@ -601,7 +678,7 @@ export function makeDoraAdapter(settings: DoraSettings, options?: DoraAdapterLiv
         const binding: DoraBinding = { provider: "dora", providerInstanceId: String(instanceId), threadId: String(input.threadId), worktree: cwd, sessionId: resume?.sessionId ?? `t3-${String(input.threadId)}` };
         const process = await (options?.createProcess ?? makeNodeDoraJsonlProcess)({ binaryPath: settings.binaryPath, launchArgs: parseLaunchArgs(settings.launchArgs), cwd, environment: sanitizeDoraEnvironment(options?.environment) });
         const now = new Date().toISOString();
-        const ctx: DoraContext = { threadId: input.threadId, process, work, providerInstanceId: instanceId, providerSessionId: resume?.sessionId, activeTurnId: undefined, turns: [], receipts: new Map(), interactions: new Map(), closePromise: undefined, stopped: false, session: { provider: PROVIDER, providerInstanceId: instanceId, status: "ready", runtimeMode: input.runtimeMode, cwd, ...(input.modelSelection ? { model: input.modelSelection.model } : {}), threadId: input.threadId, ...(resume ? { resumeCursor: { schemaVersion: DORA_RESUME_VERSION, sessionId: resume.sessionId } } : {}), createdAt: now, updatedAt: now } };
+        const ctx: DoraContext = { threadId: input.threadId, process, work, providerInstanceId: instanceId, providerSessionId: resume?.sessionId, provisionalSessionId: resume ? undefined : binding.sessionId, sessionHandshakeRequestId: undefined, receiptedTurnId: undefined, activeTurnId: undefined, turns: [], receipts: new Map(), interactions: new Map(), closePromise: undefined, stopped: false, session: { provider: PROVIDER, providerInstanceId: instanceId, status: "ready", runtimeMode: input.runtimeMode, cwd, ...(input.modelSelection ? { model: input.modelSelection.model } : {}), threadId: input.threadId, ...(resume ? { resumeCursor: { schemaVersion: DORA_RESUME_VERSION, sessionId: resume.sessionId } } : {}), createdAt: now, updatedAt: now } };
         sessions.set(input.threadId, ctx);
         void consume(ctx);
         try {
