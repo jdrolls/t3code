@@ -15,6 +15,7 @@ import {
   TurnId,
   type OrchestrationEvent,
   ProviderInstanceId,
+  ProviderSessionId,
 } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it as effectIt } from "@effect/vitest";
@@ -53,6 +54,7 @@ import {
 } from "../Services/ProjectionPipeline.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { ServerConfig } from "../../config.ts";
+import { createAuthenticatedDoraActivityCapability } from "../DoraActivityAuthorization.ts";
 
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asMessageId = (value: string): MessageId => MessageId.make(value);
@@ -1854,5 +1856,197 @@ describe("OrchestrationEngine", () => {
     expect(withoutOrigin?.metadata.origin).toBeUndefined();
 
     await system.dispose();
+  });
+
+  it("accepts Dora activities only through a session-bound trusted provider capability", async () => {
+    const system = await createOrchestrationSystem();
+    const { engine } = system;
+    const projectId = ProjectId.make("project-dora-boundary");
+    const threadId = ThreadId.make("thread-dora-boundary");
+    const createdAt = "2026-01-01T00:00:00.000Z";
+    const providerInstanceId = ProviderInstanceId.make("dora");
+    const providerSessionId = ProviderSessionId.make("dora-session-1");
+    const activity = (
+      kind: "dora.plan" | "dora.replan" | "dora.verification" | "dora.side-effect",
+      commandId: CommandId,
+    ) => ({
+      type: "thread.activity.append" as const,
+      commandId,
+      threadId,
+      providerInstanceId,
+      providerSessionId,
+      activity: {
+        id: EventId.make(`activity-${kind}`),
+        tone: "info" as const,
+        kind,
+        summary: `${kind} completed`,
+        payload: { steps: ["inspect", "verify"] },
+        turnId: null,
+        createdAt: "2031-01-01T00:00:00.000Z",
+      },
+      createdAt: "2031-01-01T00:00:00.000Z",
+    });
+    try {
+      await system.run(
+        engine.dispatch({
+          type: "project.create",
+          commandId: CommandId.make("cmd-dora-project"),
+          projectId,
+          title: "Dora project",
+          workspaceRoot: "/tmp/dora-boundary",
+          createdAt,
+        }),
+      );
+      await system.run(
+        engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("cmd-dora-thread"),
+          threadId,
+          projectId,
+          title: "Dora thread",
+          modelSelection: { instanceId: providerInstanceId, model: "dora" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdAt,
+        }),
+      );
+
+      await expect(
+        system.run(
+          engine.dispatch(
+            activity("dora.plan", CommandId.make("cmd-dora-plan-unauthenticated")),
+          ),
+        ),
+      ).rejects.toThrow("authenticated control-plane capability");
+
+      await system.run(
+        engine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("cmd-dora-session"),
+          threadId,
+          createdAt,
+          session: {
+            threadId,
+            status: "ready",
+            providerName: "dora",
+            providerInstanceId,
+            providerSessionId,
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: createdAt,
+          },
+        }),
+      );
+      const capability = createAuthenticatedDoraActivityCapability({
+        threadId,
+        providerInstanceId,
+        providerSessionId,
+      });
+      await expect(
+        system.run(
+          engine.dispatch(activity("dora.plan", CommandId.make("cmd-dora-plan-wrong-session")), {
+            doraActivityCapability: createAuthenticatedDoraActivityCapability({
+              threadId,
+              providerInstanceId,
+              providerSessionId: ProviderSessionId.make("wrong-session"),
+            }),
+          }),
+        ),
+      ).rejects.toThrow("Dora activity does not carry the authenticated provider session binding.");
+      for (const kind of [
+        "dora.plan",
+        "dora.replan",
+        "dora.verification",
+        "dora.side-effect",
+      ] as const) {
+        await system.run(
+          engine.dispatch(activity(kind, CommandId.make(`cmd-dora-${kind}-accepted`)), {
+            doraActivityCapability: capability,
+          }),
+        );
+      }
+      const events = await system.run(
+        Stream.runCollect(engine.readEvents(0)).pipe(Effect.map((chunk) => Array.from(chunk))),
+      );
+      const doraActivities = events.filter(
+        (event) => event.type === "thread.activity-appended" && event.payload.activity.kind.startsWith("dora."),
+      );
+      expect(doraActivities).toHaveLength(4);
+      for (const event of doraActivities) {
+        if (event.type !== "thread.activity-appended") continue;
+        expect(event.payload.activity.createdAt).toBe(event.occurredAt);
+        expect(event.payload.activity.createdAt).not.toBe("2031-01-01T00:00:00.000Z");
+      }
+
+      const secretBearingActivity = activity("dora.plan", CommandId.make("cmd-dora-secret"));
+      await expect(
+        system.run(
+          engine.dispatch(
+            {
+              ...secretBearingActivity,
+              activity: {
+                ...secretBearingActivity.activity,
+                summary: "authorization: Bearer private-secret",
+              },
+            },
+            { doraActivityCapability: capability },
+          ),
+        ),
+      ).rejects.toThrow("secret-bearing");
+
+      const excessivelyDeepActivity = activity("dora.plan", CommandId.make("cmd-dora-depth"));
+      await expect(
+        system.run(
+          engine.dispatch(
+            {
+              ...excessivelyDeepActivity,
+              activity: {
+                ...excessivelyDeepActivity.activity,
+                payload: {
+                  one: {
+                    two: {
+                      three: {
+                        four: {
+                          five: { six: "deep" },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            { doraActivityCapability: capability },
+          ),
+        ),
+      ).rejects.toThrow("maximum depth");
+
+    } finally {
+      await system.dispose();
+    }
+  });
+
+  it.each([
+    { name: "non-Dora", providerName: "codex", providerSessionId: "other-session", status: "ready" },
+    { name: "absent", providerName: null, providerSessionId: undefined, status: undefined },
+    { name: "stopped", providerName: "dora", providerSessionId: "dora-session-stopped", status: "stopped" },
+  ] as const)("rejects a trusted Dora capability for a $name session", async ({ providerName, providerSessionId, status }) => {
+    const system = await createOrchestrationSystem();
+    const projectId = ProjectId.make(`project-dora-${providerName ?? "absent"}-${status ?? "none"}`);
+    const threadId = ThreadId.make(`thread-dora-${providerName ?? "absent"}-${status ?? "none"}`);
+    const providerInstanceId = ProviderInstanceId.make("dora");
+    const createdAt = now();
+    try {
+      await system.run(system.engine.dispatch({ type: "project.create", commandId: CommandId.make(`cmd-${threadId}-project`), projectId, title: "Project", workspaceRoot: `/tmp/${threadId}`, createdAt }));
+      await system.run(system.engine.dispatch({ type: "thread.create", commandId: CommandId.make(`cmd-${threadId}-thread`), threadId, projectId, title: "Thread", modelSelection: { instanceId: providerInstanceId, model: "dora" }, runtimeMode: "full-access", interactionMode: "default", branch: null, worktreePath: null, createdAt }));
+      if (status !== undefined && providerName !== null && providerSessionId !== undefined) {
+        await system.run(system.engine.dispatch({ type: "thread.session.set", commandId: CommandId.make(`cmd-${threadId}-session`), threadId, createdAt, session: { threadId, status, providerName, providerInstanceId, providerSessionId, runtimeMode: "full-access", activeTurnId: null, lastError: null, updatedAt: createdAt } }));
+      }
+      await expect(system.run(system.engine.dispatch({ type: "thread.activity.append", commandId: CommandId.make(`cmd-${threadId}-activity`), threadId, providerInstanceId, providerSessionId: ProviderSessionId.make(providerSessionId ?? "missing"), activity: { id: EventId.make(`activity-${threadId}`), tone: "info", kind: "dora.plan", summary: "Plan", payload: {}, turnId: null, createdAt }, createdAt }, { doraActivityCapability: createAuthenticatedDoraActivityCapability({ threadId, providerInstanceId, providerSessionId: ProviderSessionId.make(providerSessionId ?? "missing") }) }))).rejects.toThrow("active bound Dora session");
+    } finally {
+      await system.dispose();
+    }
   });
 });

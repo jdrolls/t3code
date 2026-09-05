@@ -80,6 +80,8 @@ export type ServerAuthSessionMethod = typeof ServerAuthSessionMethod.Type;
 
 export const AuthOrchestrationReadScope = "orchestration:read" as const;
 export const AuthOrchestrationOperateScope = "orchestration:operate" as const;
+/** Dedicated scope for an authenticated Dora control-plane projection client. */
+export const AuthDoraControlPlaneScope = "dora:control-plane" as const;
 export const AuthTerminalOperateScope = "terminal:operate" as const;
 export const AuthReviewWriteScope = "review:write" as const;
 export const AuthAccessReadScope = "access:read" as const;
@@ -89,6 +91,7 @@ export const AuthRelayWriteScope = "relay:write" as const;
 export const AuthEnvironmentScope = Schema.Literals([
   AuthOrchestrationReadScope,
   AuthOrchestrationOperateScope,
+  AuthDoraControlPlaneScope,
   AuthTerminalOperateScope,
   AuthReviewWriteScope,
   AuthAccessReadScope,
@@ -109,6 +112,7 @@ export const AuthStandardClientScopes = [
 ] as const;
 export const AuthAdministrativeScopes = [
   ...AuthStandardClientScopes,
+  AuthDoraControlPlaneScope,
   AuthAccessReadScope,
   AuthAccessWriteScope,
   AuthRelayWriteScope,

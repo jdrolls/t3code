@@ -22,6 +22,7 @@ import type * as Stream from "effect/Stream";
 
 import type { OrchestrationDispatchError } from "../Errors.ts";
 import type { OrchestrationEventStoreError } from "../../persistence/Errors.ts";
+import type { AuthenticatedDoraActivityCapability } from "../DoraActivityAuthorization.ts";
 
 /**
  * OrchestrationEngineShape - Service API for orchestration command and event flow.
@@ -46,8 +47,8 @@ export interface OrchestrationEngineShape {
    * Dispatch a validated orchestration command.
    *
    * @param command - Valid orchestration command.
-   * @param options - Optional client origin (surface/app version) stamped into
-   *   the metadata of every event the command produces.
+   * @param options - Optional client origin stamped into event metadata, or a
+   *   authenticated Dora control-plane capability for a session-bound activity append.
    * @returns Effect containing the sequence of the persisted event.
    *
    * Dispatch is serialized through an internal queue and deduplicated via
@@ -55,7 +56,10 @@ export interface OrchestrationEngineShape {
    */
   readonly dispatch: (
     command: OrchestrationCommand,
-    options?: { readonly origin?: OrchestrationClientOrigin },
+    options?: {
+      readonly origin?: OrchestrationClientOrigin;
+      readonly doraActivityCapability?: AuthenticatedDoraActivityCapability;
+    },
   ) => Effect.Effect<{ sequence: number }, OrchestrationDispatchError, never>;
 
   /**

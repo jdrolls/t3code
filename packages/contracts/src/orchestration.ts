@@ -462,6 +462,45 @@ export const OrchestrationThreadActivity = Schema.Struct({
 });
 export type OrchestrationThreadActivity = typeof OrchestrationThreadActivity.Type;
 
+// Dora control-plane activity wire shape. It remains narrow and data-only;
+// the authenticated WebSocket handler supplies the non-serializable authority
+// that the engine requires before it can be appended.
+export const DORA_CLIENT_ACTIVITY_MAX_ID_CHARS = 256;
+export const DORA_CLIENT_ACTIVITY_MAX_SUMMARY_CHARS = 2_000;
+export const DORA_CLIENT_ACTIVITY_MAX_CREATED_AT_CHARS = 64;
+
+export const DoraClientThreadActivityKind = Schema.Literals([
+  "dora.plan",
+  "dora.replan",
+  "dora.verification",
+  "dora.side-effect",
+]);
+export type DoraClientThreadActivityKind = typeof DoraClientThreadActivityKind.Type;
+
+const DoraClientActivityId = EventId.check(Schema.isMaxLength(DORA_CLIENT_ACTIVITY_MAX_ID_CHARS));
+const DoraClientActivitySummary = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(DORA_CLIENT_ACTIVITY_MAX_SUMMARY_CHARS),
+);
+const DoraClientActivityCreatedAt = IsoDateTime.check(
+  Schema.isMaxLength(DORA_CLIENT_ACTIVITY_MAX_CREATED_AT_CHARS),
+);
+
+/**
+ * Wire shape for the sole activity a client may append. `payload` receives a
+ * structural, bounded JSON-value check in the server normalizer because it is
+ * recursive and must also protect direct in-process dispatch callers.
+ */
+export const DoraClientThreadActivity = Schema.Struct({
+  id: DoraClientActivityId,
+  tone: Schema.Literal("info"),
+  kind: DoraClientThreadActivityKind,
+  summary: DoraClientActivitySummary,
+  payload: Schema.Unknown,
+  turnId: Schema.Null,
+  createdAt: DoraClientActivityCreatedAt,
+});
+export type DoraClientThreadActivity = typeof DoraClientThreadActivity.Type;
+
 const OrchestrationLatestTurnState = Schema.Literals([
   "running",
   "interrupted",
@@ -1053,7 +1092,25 @@ const ThreadSessionStopCommand = Schema.Struct({
   onlyIfSettled: Schema.optional(Schema.Boolean),
 });
 
-const DispatchableClientOrchestrationCommand = Schema.Union([
+/**
+ * Narrow, externally dispatchable Dora projection command. The bound provider
+ * identities are opaque session capabilities, not display metadata: transport
+ * authentication and the engine both verify them against the active session
+ * before accepting the retained activity.
+ */
+export const DoraClientThreadActivityAppendCommand = Schema.Struct({
+  type: Schema.Literal("thread.activity.append"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  providerInstanceId: ProviderInstanceId,
+  providerSessionId: ProviderSessionId,
+  activity: DoraClientThreadActivity,
+  createdAt: IsoDateTime,
+});
+export type DoraClientThreadActivityAppendCommand =
+  typeof DoraClientThreadActivityAppendCommand.Type;
+
+export const DispatchableClientOrchestrationCommand = Schema.Union([
   ProjectCreateCommand,
   ProjectMetaUpdateCommand,
   ProjectDeleteCommand,
@@ -1077,6 +1134,7 @@ const DispatchableClientOrchestrationCommand = Schema.Union([
   ThreadUserInputRespondCommand,
   ThreadCheckpointRevertCommand,
   ThreadSessionStopCommand,
+  DoraClientThreadActivityAppendCommand,
 ]);
 export type DispatchableClientOrchestrationCommand =
   typeof DispatchableClientOrchestrationCommand.Type;
@@ -1105,6 +1163,7 @@ export const ClientOrchestrationCommand = Schema.Union([
   ThreadUserInputRespondCommand,
   ThreadCheckpointRevertCommand,
   ThreadSessionStopCommand,
+  DoraClientThreadActivityAppendCommand,
 ]);
 export type ClientOrchestrationCommand = typeof ClientOrchestrationCommand.Type;
 

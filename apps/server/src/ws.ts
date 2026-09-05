@@ -11,6 +11,7 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import {
   DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL,
+  AuthDoraControlPlaneScope,
   AuthAccessStreamError,
   type AuthAccessStreamEvent,
   type AuthEnvironmentScope,
@@ -27,6 +28,7 @@ import {
   type FileManagerRevealKind,
   type OrchestrationClientOrigin,
   type OrchestrationCommand,
+  type DoraClientThreadActivityAppendCommand,
   type GitActionProgressEvent,
   type GitManagerServiceError,
   OrchestrationDispatchCommandError,
@@ -85,6 +87,8 @@ import {
   cleanupFailedUploadedAttachments,
   normalizeDispatchCommand,
 } from "./orchestration/Normalizer.ts";
+import { createAuthenticatedDoraActivityCapability } from "./orchestration/DoraActivityAuthorization.ts";
+import type { OrchestrationDispatchError } from "./orchestration/Errors.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ThreadDeletionReactor } from "./orchestration/Services/ThreadDeletionReactor.ts";
@@ -477,13 +481,45 @@ const makeWsRpcLayer = (
       // the client's request caused them.
       const hasClientOrigin =
         clientOrigin.surface !== undefined || clientOrigin.appVersion !== undefined;
-      const dispatchFromClient: OrchestrationEngine.OrchestrationEngineShape["dispatch"] = (
-        command,
-      ) =>
-        orchestrationEngine.dispatch(
+      const isDoraControlPlaneActivity = (
+        command: OrchestrationCommand,
+      ): command is DoraClientThreadActivityAppendCommand =>
+        command.type === "thread.activity.append" &&
+        "providerInstanceId" in command &&
+        "providerSessionId" in command &&
+        command.activity.kind.startsWith("dora.");
+      const dispatchFromClient: (
+        command: OrchestrationCommand,
+      ) => Effect.Effect<
+        { readonly sequence: number },
+        OrchestrationDispatchError | OrchestrationDispatchCommandError
+      > = (command) => {
+        if (isDoraControlPlaneActivity(command)) {
+          if (!currentSession.scopes.includes(AuthDoraControlPlaneScope)) {
+            // Preserve the transport authorization detail as the cause while
+            // returning the dispatch command error declared by this wrapper,
+            // rather than widening its effect with EnvironmentAuthorizationError.
+            return Effect.fail(
+              new OrchestrationDispatchCommandError({
+                message: `The authenticated token is missing required scope: ${AuthDoraControlPlaneScope}.`,
+                cause: authorizationError(AuthDoraControlPlaneScope),
+              }),
+            );
+          }
+          return orchestrationEngine.dispatch(command, {
+            ...(hasClientOrigin ? { origin: clientOrigin } : {}),
+            doraActivityCapability: createAuthenticatedDoraActivityCapability({
+              threadId: command.threadId,
+              providerInstanceId: command.providerInstanceId,
+              providerSessionId: command.providerSessionId,
+            }),
+          });
+        }
+        return orchestrationEngine.dispatch(
           command,
           hasClientOrigin ? { origin: clientOrigin } : undefined,
         );
+      };
       const recordClientCommandAnalytics = (command: OrchestrationCommand) => {
         switch (command.type) {
           case "thread.create":

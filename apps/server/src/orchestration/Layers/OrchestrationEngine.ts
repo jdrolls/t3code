@@ -41,6 +41,11 @@ import {
   type OrchestrationProjectorDecodeError,
 } from "../Errors.ts";
 import { decideOrchestrationCommand } from "../decider.ts";
+import { validateDoraActivity } from "../Normalizer.ts";
+import {
+  isAuthenticatedDoraActivityCapability,
+  type AuthenticatedDoraActivityCapability,
+} from "../DoraActivityAuthorization.ts";
 import { createEmptyReadModel, projectEvent } from "../projector.ts";
 import { OrchestrationProjectionPipeline } from "../Services/ProjectionPipeline.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
@@ -57,6 +62,7 @@ const isOrchestrationCommandIdConflictError = Schema.is(OrchestrationCommandIdCo
 interface CommandEnvelope {
   command: OrchestrationCommand;
   origin: OrchestrationClientOrigin | undefined;
+  doraActivityCapability: AuthenticatedDoraActivityCapability | undefined;
   result: Deferred.Deferred<{ sequence: number }, OrchestrationDispatchError>;
   startedAtMs: number;
 }
@@ -95,6 +101,71 @@ const makeOrchestrationEngine = Effect.gen(function* () {
 
   const commandQueue = yield* Queue.unbounded<CommandEnvelope>();
   const eventPubSub = yield* PubSub.unbounded<OrchestrationEvent>();
+
+  const authorizeDoraActivity = (
+    command: OrchestrationCommand,
+    capability: AuthenticatedDoraActivityCapability | undefined,
+    receivedAt: string,
+  ): Effect.Effect<OrchestrationCommand, OrchestrationCommandInvariantError> => {
+    if (command.type !== "thread.activity.append" || !command.activity.kind.startsWith("dora.")) {
+      return Effect.succeed(command);
+    }
+    if (!isAuthenticatedDoraActivityCapability(capability)) {
+      return Effect.fail(
+        new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: "Dora activity append requires an authenticated control-plane capability.",
+        }),
+      );
+    }
+    if (
+      !("providerInstanceId" in command) ||
+      !("providerSessionId" in command) ||
+      command.providerInstanceId !== capability.providerInstanceId ||
+      command.providerSessionId !== capability.providerSessionId
+    ) {
+      return Effect.fail(
+        new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: "Dora activity does not carry the authenticated provider session binding.",
+        }),
+      );
+    }
+    const validationError = validateDoraActivity(command.activity);
+    if (validationError !== undefined) {
+      return Effect.fail(
+        new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Invalid Dora activity: ${validationError}.`,
+        }),
+      );
+    }
+    const thread = commandReadModel.threads.find((candidate) => candidate.id === command.threadId);
+    const session = thread?.session;
+    if (
+      thread?.deletedAt !== null ||
+      session === null ||
+      session?.providerName !== "dora" ||
+      (session.status !== "running" && session.status !== "ready") ||
+      session.providerInstanceId !== capability.providerInstanceId ||
+      session.providerSessionId !== capability.providerSessionId ||
+      capability.threadId !== command.threadId
+    ) {
+      return Effect.fail(
+        new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: "Dora activity does not match an active bound Dora session.",
+        }),
+      );
+    }
+    // The authenticated control-plane path cannot preserve a caller-controlled
+    // clock in retained activity data. Stamp both command and activity at engine receipt time.
+    return Effect.succeed({
+      ...command,
+      createdAt: receivedAt,
+      activity: { ...command.activity, createdAt: receivedAt },
+    });
+  };
 
   const projectEventsOntoReadModel = (
     baseReadModel: OrchestrationReadModel,
@@ -140,6 +211,12 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           "orchestration.aggregate_kind": aggregateRef.aggregateKind,
           "orchestration.aggregate_id": aggregateRef.aggregateId,
         });
+
+        const command = yield* authorizeDoraActivity(
+          envelope.command,
+          envelope.doraActivityCapability,
+          yield* nowIso,
+        );
 
         const existingReceipt = yield* commandReceiptRepository.getByCommandId({
           commandId: envelope.command.commandId,
@@ -202,7 +279,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             ? yield* projectionSnapshotQuery.getUserInputActivity(envelope.command)
             : Option.none();
         const eventBase = yield* decideOrchestrationCommand({
-          command: envelope.command,
+          command,
           readModel: commandReadModel,
           ...(Option.isSome(userInputActivity)
             ? { userInputActivity: userInputActivity.value }
@@ -387,6 +464,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       yield* Queue.offer(commandQueue, {
         command,
         origin: options?.origin,
+        doraActivityCapability: options?.doraActivityCapability,
         result,
         startedAtMs: yield* Clock.currentTimeMillis,
       });

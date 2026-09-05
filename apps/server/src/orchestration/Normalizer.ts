@@ -4,6 +4,8 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import {
   type ClientOrchestrationCommand,
+  DORA_CLIENT_ACTIVITY_MAX_ID_CHARS,
+  DORA_CLIENT_ACTIVITY_MAX_SUMMARY_CHARS,
   type IsoDateTime,
   type OrchestrationCommand,
   OrchestrationDispatchCommandError,
@@ -33,6 +35,16 @@ export const canonicalizeClientCommandTimestamps = (
         }
       : command;
 
+  if (canonicalCommand.type === "thread.activity.append") {
+    return {
+      ...canonicalCommand,
+      activity: {
+        ...canonicalCommand.activity,
+        createdAt: receivedAt,
+      },
+    };
+  }
+
   if (canonicalCommand.type !== "thread.turn.start" || !canonicalCommand.bootstrap?.createThread) {
     return canonicalCommand;
   }
@@ -48,6 +60,179 @@ export const canonicalizeClientCommandTimestamps = (
     },
   };
 };
+
+const DORA_ACTIVITY_KINDS = new Set([
+  "dora.plan",
+  "dora.replan",
+  "dora.verification",
+  "dora.side-effect",
+]);
+const DORA_ACTIVITY_MAX_PAYLOAD_BYTES = 16 * 1024;
+const DORA_ACTIVITY_MAX_PAYLOAD_DEPTH = 5;
+const DORA_ACTIVITY_MAX_PAYLOAD_NODES = 200;
+const DORA_ACTIVITY_MAX_RECORD_KEYS = 50;
+const DORA_ACTIVITY_MAX_ARRAY_ITEMS = 50;
+const DORA_ACTIVITY_MAX_KEY_CHARS = 128;
+const DORA_ACTIVITY_MAX_STRING_CHARS = 4_096;
+const UNSAFE_JSON_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+/**
+ * Trusted Dora payloads become retained projection data. Accept only a small,
+ * data-only JSON tree so the engine's provider path cannot smuggle executable
+ * values, prototype-sensitive keys, or an unbounded retained object graph.
+ */
+function validateDoraActivityPayload(payload: unknown): string | undefined {
+  const seen = new WeakSet<object>();
+  let nodeCount = 0;
+
+  const visit = (value: unknown, depth: number): string | undefined => {
+    if (depth > DORA_ACTIVITY_MAX_PAYLOAD_DEPTH) {
+      return `payload exceeds maximum depth of ${DORA_ACTIVITY_MAX_PAYLOAD_DEPTH}`;
+    }
+    nodeCount += 1;
+    if (nodeCount > DORA_ACTIVITY_MAX_PAYLOAD_NODES) {
+      return `payload exceeds maximum node count of ${DORA_ACTIVITY_MAX_PAYLOAD_NODES}`;
+    }
+
+    if (value === null || typeof value === "boolean") return undefined;
+    if (typeof value === "string") {
+      return value.length <= DORA_ACTIVITY_MAX_STRING_CHARS
+        ? undefined
+        : `payload string exceeds ${DORA_ACTIVITY_MAX_STRING_CHARS} characters`;
+    }
+    if (typeof value === "number") {
+      return Number.isFinite(value) ? undefined : "payload contains a non-finite number";
+    }
+    if (typeof value !== "object") return "payload contains a non-JSON value";
+    if (seen.has(value)) return "payload contains a repeated or cyclic reference";
+    seen.add(value);
+
+    if (Array.isArray(value)) {
+      if (Object.getPrototypeOf(value) !== Array.prototype || Object.getOwnPropertySymbols(value).length > 0) {
+        return "payload arrays must be plain data-only arrays";
+      }
+      if (value.length > DORA_ACTIVITY_MAX_ARRAY_ITEMS) {
+        return `payload array exceeds ${DORA_ACTIVITY_MAX_ARRAY_ITEMS} items`;
+      }
+      const propertyNames = Object.getOwnPropertyNames(value);
+      if (propertyNames.length !== value.length + 1 || !propertyNames.includes("length")) {
+        return "payload arrays must be dense data-only arrays";
+      }
+      for (let index = 0; index < value.length; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+        if (!descriptor?.enumerable || !("value" in descriptor)) {
+          return "payload arrays must be dense data-only arrays";
+        }
+        const error = visit(descriptor.value, depth + 1);
+        if (error !== undefined) return error;
+      }
+      return undefined;
+    }
+
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      return "payload records must be plain objects";
+    }
+    if (Object.getOwnPropertySymbols(value).length > 0) {
+      return "payload records cannot contain symbol keys";
+    }
+    const propertyNames = Object.getOwnPropertyNames(value);
+    if (propertyNames.length > DORA_ACTIVITY_MAX_RECORD_KEYS) {
+      return `payload record exceeds ${DORA_ACTIVITY_MAX_RECORD_KEYS} keys`;
+    }
+    for (const key of propertyNames) {
+      if (
+        key.length > DORA_ACTIVITY_MAX_KEY_CHARS ||
+        UNSAFE_JSON_KEYS.has(key)
+      ) {
+        return "payload contains an unsafe or oversized key";
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor?.enumerable || !("value" in descriptor)) {
+        return "payload records must contain enumerable data properties only";
+      }
+      const error = visit(descriptor.value, depth + 1);
+      if (error !== undefined) return error;
+    }
+    return undefined;
+  };
+
+  try {
+    const rootIsRecord =
+      typeof payload === "object" &&
+      payload !== null &&
+      !Array.isArray(payload) &&
+      (Object.getPrototypeOf(payload) === Object.prototype || Object.getPrototypeOf(payload) === null);
+    if (!rootIsRecord) return "payload must be a JSON-safe record";
+
+    const structuralError = visit(payload, 0);
+    if (structuralError !== undefined) return structuralError;
+    const serialized = JSON.stringify(payload);
+    if (serialized === undefined || Buffer.byteLength(serialized, "utf8") > DORA_ACTIVITY_MAX_PAYLOAD_BYTES) {
+      return `payload exceeds ${DORA_ACTIVITY_MAX_PAYLOAD_BYTES} bytes`;
+    }
+    return undefined;
+  } catch {
+    return "payload must be a JSON-safe record";
+  }
+}
+
+export interface DoraActivityCandidate {
+  readonly id: unknown;
+  readonly tone: unknown;
+  readonly kind: unknown;
+  readonly summary: unknown;
+  readonly payload: unknown;
+  readonly turnId: unknown;
+}
+
+/** Shared by the RPC normalizer and engine-side trusted Dora dispatch. */
+export function validateDoraActivity(activity: DoraActivityCandidate): string | undefined {
+  if (
+    typeof activity.id !== "string" ||
+    activity.id.length === 0 ||
+    activity.id.length > DORA_CLIENT_ACTIVITY_MAX_ID_CHARS
+  ) {
+    return "activity id is invalid or oversized";
+  }
+  if (typeof activity.kind !== "string" || !DORA_ACTIVITY_KINDS.has(activity.kind)) {
+    return "activity kind is not a Dora projection kind";
+  }
+  if (activity.tone !== "info") return "activity tone must be info";
+  if (activity.turnId !== null) return "activity turnId must be null";
+  if (
+    typeof activity.summary !== "string" ||
+    activity.summary.trim().length === 0 ||
+    activity.summary.length > DORA_CLIENT_ACTIVITY_MAX_SUMMARY_CHARS
+  ) {
+    return "activity summary is invalid or oversized";
+  }
+  const payloadValidationError = validateDoraActivityPayload(activity.payload);
+  if (payloadValidationError !== undefined) return payloadValidationError;
+  if (containsDoraSecret(activity.summary) || containsDoraSecret(activity.payload)) {
+    return "activity contains secret-bearing content";
+  }
+  return undefined;
+}
+
+/** Reject common credential forms before a Dora projection becomes retained data. */
+export function containsDoraSecret(value: unknown, seen = new Set<unknown>()): boolean {
+  if (typeof value === "string") {
+    return /(?:api[_-]?key|authorization|secret|password|token)\s*[:=]|bearer\s+[a-z0-9._~+/=-]{8,}/iu.test(
+      value,
+    );
+  }
+  if (typeof value !== "object" || value === null) return false;
+  if (seen.has(value)) return false;
+  seen.add(value);
+  if (Array.isArray(value)) return value.some((entry) => containsDoraSecret(entry, seen));
+  return Object.entries(value).some(
+    ([key, entry]) =>
+      /(?:api[_-]?key|authorization|secret|password|credential|access[_-]?token|refresh[_-]?token|token)/iu.test(
+        key,
+      ) || containsDoraSecret(entry, seen),
+  );
+}
 
 const removeClaimedAttachmentPaths = Effect.fn("Normalizer.removeClaimedAttachmentPaths")(
   function* (attachmentPaths: ReadonlyArray<string>) {
@@ -76,6 +261,20 @@ export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
   Effect.gen(function* () {
     const receivedAt = DateTime.formatIso(yield* DateTime.now);
     const canonicalCommand = canonicalizeClientCommandTimestamps(command, receivedAt);
+
+    if (canonicalCommand.type === "thread.activity.append") {
+      const validationError = validateDoraActivity(canonicalCommand.activity);
+      if (validationError !== undefined) {
+        return yield* new OrchestrationDispatchCommandError({
+          message: `Invalid Dora activity: ${validationError}.`,
+        });
+      }
+      // The WebSocket handler separately requires the Dora control-plane scope
+      // and supplies its non-serializable capability. Keeping the command
+      // data-only here means direct engine callers cannot recreate that proof.
+      return canonicalCommand as OrchestrationCommand;
+    }
+
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const serverConfig = yield* ServerConfig;
