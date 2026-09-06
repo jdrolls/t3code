@@ -171,9 +171,9 @@ function doraActivityCommand(payload: unknown): DoraActivityAppendCommand {
 describe("normalizeDispatchCommand Dora activities", () => {
   it("normalizes a valid externally dispatched Dora activity", async () => {
     const normalized = await Effect.runPromise(
-      normalizeDispatchCommand(doraActivityCommand({ plan: ["inspect", "verify"], attempts: 1 })).pipe(
-        Effect.provide(testLayer),
-      ),
+      normalizeDispatchCommand(
+        doraActivityCommand({ plan: ["inspect", "verify"], attempts: 1 }),
+      ).pipe(Effect.provide(testLayer)),
     );
     if (!isNormalizedDoraActivityAppendCommand(normalized)) {
       throw new Error("Expected a Dora activity append command.");
@@ -209,7 +209,9 @@ describe("normalizeDispatchCommand Dora activities", () => {
     expect(
       validateDoraActivity({
         ...validActivity,
-        payload: { diagnostics: { detail: "Provider response included Bearer abcdefghijklmno in prose." } },
+        payload: {
+          diagnostics: { detail: "Provider response included Bearer abcdefghijklmno in prose." },
+        },
       }),
     ).toContain("secret-bearing");
   });
@@ -224,7 +226,10 @@ describe("normalizeDispatchCommand Dora activities", () => {
     }
 
     const error = await Effect.runPromise(
-      normalizeDispatchCommand(doraActivityCommand(payload)).pipe(Effect.provide(testLayer), Effect.flip),
+      normalizeDispatchCommand(doraActivityCommand(payload)).pipe(
+        Effect.provide(testLayer),
+        Effect.flip,
+      ),
     );
 
     expect(error._tag).toBe("OrchestrationDispatchCommandError");

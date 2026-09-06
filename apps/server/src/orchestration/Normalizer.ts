@@ -108,7 +108,10 @@ function validateDoraActivityPayload(payload: unknown): string | undefined {
     seen.add(value);
 
     if (Array.isArray(value)) {
-      if (Object.getPrototypeOf(value) !== Array.prototype || Object.getOwnPropertySymbols(value).length > 0) {
+      if (
+        Object.getPrototypeOf(value) !== Array.prototype ||
+        Object.getOwnPropertySymbols(value).length > 0
+      ) {
         return "payload arrays must be plain data-only arrays";
       }
       if (value.length > DORA_ACTIVITY_MAX_ARRAY_ITEMS) {
@@ -141,10 +144,7 @@ function validateDoraActivityPayload(payload: unknown): string | undefined {
       return `payload record exceeds ${DORA_ACTIVITY_MAX_RECORD_KEYS} keys`;
     }
     for (const key of propertyNames) {
-      if (
-        key.length > DORA_ACTIVITY_MAX_KEY_CHARS ||
-        UNSAFE_JSON_KEYS.has(key)
-      ) {
+      if (key.length > DORA_ACTIVITY_MAX_KEY_CHARS || UNSAFE_JSON_KEYS.has(key)) {
         return "payload contains an unsafe or oversized key";
       }
       const descriptor = Object.getOwnPropertyDescriptor(value, key);
@@ -162,13 +162,17 @@ function validateDoraActivityPayload(payload: unknown): string | undefined {
       typeof payload === "object" &&
       payload !== null &&
       !Array.isArray(payload) &&
-      (Object.getPrototypeOf(payload) === Object.prototype || Object.getPrototypeOf(payload) === null);
+      (Object.getPrototypeOf(payload) === Object.prototype ||
+        Object.getPrototypeOf(payload) === null);
     if (!rootIsRecord) return "payload must be a JSON-safe record";
 
     const structuralError = visit(payload, 0);
     if (structuralError !== undefined) return structuralError;
     const serialized = JSON.stringify(payload);
-    if (serialized === undefined || Buffer.byteLength(serialized, "utf8") > DORA_ACTIVITY_MAX_PAYLOAD_BYTES) {
+    if (
+      serialized === undefined ||
+      Buffer.byteLength(serialized, "utf8") > DORA_ACTIVITY_MAX_PAYLOAD_BYTES
+    ) {
       return `payload exceeds ${DORA_ACTIVITY_MAX_PAYLOAD_BYTES} bytes`;
     }
     return undefined;

@@ -1041,7 +1041,7 @@ it.effect("accepts only bounded opaque provider session ids", () =>
   }),
 );
 
-it.effect("defaults proposed plan implementation metadata for historical rows",  () =>
+it.effect("defaults proposed plan implementation metadata for historical rows", () =>
   Effect.gen(function* () {
     const parsed = yield* decodeOrchestrationProposedPlan({
       id: "plan-1",

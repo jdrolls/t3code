@@ -1,6 +1,7 @@
 import * as ChildProcess from "node:child_process";
 import * as Fs from "node:fs/promises";
 import * as Path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { assert, it } from "@effect/vitest";
 
@@ -14,8 +15,13 @@ import {
 } from "./stage-t3-runtime.mjs";
 import { SERVICE_LAUNCHER_PROTOCOL } from "./lib/service-launcher-protocol.mjs";
 
+const scriptsDirectory = Path.dirname(fileURLToPath(import.meta.url));
+const repositoryRoot = Path.resolve(scriptsDirectory, "..");
+const stageRuntimeScriptPath = Path.join(scriptsDirectory, "stage-t3-runtime.mjs");
+const stageRuntimeInvocationCwds = [repositoryRoot, scriptsDirectory] as const;
+
 async function withTemporaryPackage(test: (packageRoot: string) => Promise<void>) {
-  const temporaryRoot = await Fs.mkdtemp(Path.join(process.cwd(), ".stage-t3-runtime-test-"));
+  const temporaryRoot = await Fs.mkdtemp(Path.join(scriptsDirectory, ".stage-t3-runtime-test-"));
   try {
     const packageRoot = Path.join(temporaryRoot, "source-package");
     await Fs.mkdir(packageRoot);
@@ -26,7 +32,10 @@ async function withTemporaryPackage(test: (packageRoot: string) => Promise<void>
   }
 }
 
-async function assertPromiseRejects(promise: Promise<unknown>, expectedMessage: RegExp): Promise<void> {
+async function assertPromiseRejects(
+  promise: Promise<unknown>,
+  expectedMessage: RegExp,
+): Promise<void> {
   await promise.then(
     () => assert.fail("Expected promise to reject."),
     (cause: unknown) => {
@@ -61,9 +70,14 @@ it("rejects non-canonical roots and anything inside a T3 home", () => {
   assert.throws(() => assertCanonicalStagingRoot("relative-stage", "/tmp/relative-stage"));
   assert.throws(() => assertCanonicalStagingRoot("/tmp/../stage", "/stage"));
   assert.throws(() => assertCanonicalStagingRoot("/tmp/stage", "/tmp/other-stage"));
-  assert.throws(() => assertCanonicalStagingRoot("/tmp/.t3/release-stage", "/tmp/.t3/release-stage"));
+  assert.throws(() =>
+    assertCanonicalStagingRoot("/tmp/.t3/release-stage", "/tmp/.t3/release-stage"),
+  );
   assert.throws(() => assertCanonicalStagingRoot("/", "/"));
-  assert.equal(assertCanonicalStagingRoot("/tmp/t3-release-stage", "/tmp/t3-release-stage"), "/tmp/t3-release-stage");
+  assert.equal(
+    assertCanonicalStagingRoot("/tmp/t3-release-stage", "/tmp/t3-release-stage"),
+    "/tmp/t3-release-stage",
+  );
 });
 
 it("falls back to a scoped direct node_modules package with no exports or main", async () => {
@@ -76,14 +90,21 @@ it("falls back to a scoped direct node_modules package with no exports or main",
       `${JSON.stringify({ name: dependencyName, exports: {} })}\n`,
     );
 
-    assert.equal(await resolvePackageRoot(sourceRoot, dependencyName), await Fs.realpath(dependencyRoot));
+    assert.equal(
+      await resolvePackageRoot(sourceRoot, dependencyName),
+      await Fs.realpath(dependencyRoot),
+    );
   });
 });
 
 it("allows a direct package-manager symlink outside lexical node_modules when its identity matches", async () => {
   await withTemporaryPackage(async (sourceRoot) => {
     const dependencyName = "@scope/no-exports";
-    const packageStoreRoot = Path.join(Path.dirname(sourceRoot), "package-manager-store", "no-exports");
+    const packageStoreRoot = Path.join(
+      Path.dirname(sourceRoot),
+      "package-manager-store",
+      "no-exports",
+    );
     const dependencyLink = Path.join(sourceRoot, "node_modules", "@scope", "no-exports");
     await Fs.mkdir(packageStoreRoot, { recursive: true });
     await Fs.writeFile(
@@ -91,9 +112,16 @@ it("allows a direct package-manager symlink outside lexical node_modules when it
       `${JSON.stringify({ name: dependencyName, exports: {} })}\n`,
     );
     await Fs.mkdir(Path.dirname(dependencyLink), { recursive: true });
-    await Fs.symlink(packageStoreRoot, dependencyLink, process.platform === "win32" ? "junction" : "dir");
+    await Fs.symlink(
+      packageStoreRoot,
+      dependencyLink,
+      process.platform === "win32" ? "junction" : "dir",
+    );
 
-    assert.equal(await resolvePackageRoot(sourceRoot, dependencyName), await Fs.realpath(packageStoreRoot));
+    assert.equal(
+      await resolvePackageRoot(sourceRoot, dependencyName),
+      await Fs.realpath(packageStoreRoot),
+    );
   });
 });
 
@@ -117,7 +145,11 @@ it("refuses unsafe lexical paths and direct package roots with wrong or missing 
       `${JSON.stringify({ name: "@scope/not-the-requested-package", exports: {} })}\n`,
     );
     await Fs.mkdir(Path.dirname(wrongNameLink), { recursive: true });
-    await Fs.symlink(wrongNameRoot, wrongNameLink, process.platform === "win32" ? "junction" : "dir");
+    await Fs.symlink(
+      wrongNameRoot,
+      wrongNameLink,
+      process.platform === "win32" ? "junction" : "dir",
+    );
     await assertPromiseRejects(
       resolvePackageRoot(sourceRoot, "@scope/wrong-name"),
       /does not identify '@scope\/wrong-name'/,
@@ -139,24 +171,43 @@ it("refuses unsafe lexical paths and direct package roots with wrong or missing 
 });
 
 it("stages a runnable runtime with package identity, sentinel, version, and preflight", async () => {
-  const temporaryRoot = await Fs.mkdtemp(Path.join(process.cwd(), ".stage-t3-runtime-test-"));
+  const temporaryRoot = await Fs.mkdtemp(Path.join(scriptsDirectory, ".stage-t3-runtime-test-"));
   try {
-    const stagingRoot = Path.join(temporaryRoot, "staging-root");
-    await Fs.mkdir(stagingRoot);
-    const scriptPath = Path.resolve("scripts/stage-t3-runtime.mjs");
-    const stage = ChildProcess.spawnSync("node", [scriptPath, "--staging-root", stagingRoot], {
-      encoding: "utf8",
-    });
+    const stagedByInvocationCwd = new Map<
+      string,
+      { versionRoot: string; entryPath: string; sentinelPath: string }
+    >();
+    for (const [index, cwd] of stageRuntimeInvocationCwds.entries()) {
+      const stagingRoot = Path.join(temporaryRoot, `staging-root-${String(index)}`);
+      await Fs.mkdir(stagingRoot);
+      const stage = ChildProcess.spawnSync(
+        "node",
+        [stageRuntimeScriptPath, "--staging-root", stagingRoot],
+        { cwd, encoding: "utf8" },
+      );
 
-    assert.equal(stage.error, undefined, stage.error?.message);
-    assert.equal(stage.status, 0, stage.stderr || stage.stdout);
-    const staged = JSON.parse(stage.stdout) as {
-      versionRoot: string;
-      entryPath: string;
-      sentinelPath: string;
-    };
-    assert.equal(staged.versionRoot, Path.join(stagingRoot, "runtime", "versions", RELEASE_VERSION));
-    assert.equal(staged.entryPath, Path.join(staged.versionRoot, "node_modules", "t3", "dist", "bin.mjs"));
+      assert.equal(stage.error, undefined, stage.error?.message);
+      assert.equal(stage.status, 0, stage.stderr || stage.stdout);
+      stagedByInvocationCwd.set(
+        cwd,
+        JSON.parse(stage.stdout) as {
+          versionRoot: string;
+          entryPath: string;
+          sentinelPath: string;
+        },
+      );
+    }
+    const staged = stagedByInvocationCwd.get(repositoryRoot);
+    if (staged === undefined) throw new Error("Repository-root staging result is missing.");
+    const stagingRoot = Path.join(temporaryRoot, "staging-root-0");
+    assert.equal(
+      staged.versionRoot,
+      Path.join(stagingRoot, "runtime", "versions", RELEASE_VERSION),
+    );
+    assert.equal(
+      staged.entryPath,
+      Path.join(staged.versionRoot, "node_modules", "t3", "dist", "bin.mjs"),
+    );
     assert.equal(staged.sentinelPath, Path.join(staged.versionRoot, ".install-complete"));
     assert.deepEqual(await Fs.readdir(stagingRoot), ["runtime"]);
     await assertPromiseRejects(
@@ -165,14 +216,28 @@ it("stages a runnable runtime with package identity, sentinel, version, and pref
     );
 
     const stagedT3Package = JSON.parse(
-      await Fs.readFile(Path.join(staged.versionRoot, "node_modules", "t3", "package.json"), "utf8"),
+      await Fs.readFile(
+        Path.join(staged.versionRoot, "node_modules", "t3", "package.json"),
+        "utf8",
+      ),
     ) as { name: unknown; version: unknown };
     assert.equal(stagedT3Package.name, "t3");
     assert.equal(stagedT3Package.version, RELEASE_VERSION);
 
     const externalPackageName = "@ff-labs/fff-node";
     const sourceExternalPackage = JSON.parse(
-      await Fs.readFile(Path.join("apps", "server", "node_modules", "@ff-labs", "fff-node", "package.json"), "utf8"),
+      await Fs.readFile(
+        Path.join(
+          repositoryRoot,
+          "apps",
+          "server",
+          "node_modules",
+          "@ff-labs",
+          "fff-node",
+          "package.json",
+        ),
+        "utf8",
+      ),
     ) as { name: unknown; version: unknown };
     const stagedExternalPackage = JSON.parse(
       await Fs.readFile(
@@ -185,7 +250,9 @@ it("stages a runnable runtime with package identity, sentinel, version, and pref
     assert.equal(stagedExternalPackage.version, sourceExternalPackage.version);
     assert.equal(await Fs.readFile(staged.sentinelPath, "utf8"), `${RELEASE_VERSION}\n`);
 
-    const version = ChildProcess.spawnSync("node", [staged.entryPath, "--version"], { encoding: "utf8" });
+    const version = ChildProcess.spawnSync("node", [staged.entryPath, "--version"], {
+      encoding: "utf8",
+    });
     assert.equal(version.status, 0, version.stderr || version.stdout);
     assert.include(version.stdout, RELEASE_VERSION);
 
@@ -212,9 +279,12 @@ it("stages a runnable runtime with package identity, sentinel, version, and pref
 });
 
 it("returns failure without a success payload when the staging CLI cannot start", () => {
-  const scriptPath = Path.resolve("scripts/stage-t3-runtime.mjs");
-  const missingRoot = Path.join(process.cwd(), `.stage-t3-runtime-missing-${process.pid}`);
-  const result = ChildProcess.spawnSync("node", [scriptPath, "--staging-root", missingRoot], { encoding: "utf8" });
+  const missingRoot = Path.join(scriptsDirectory, `.stage-t3-runtime-missing-${process.pid}`);
+  const result = ChildProcess.spawnSync(
+    "node",
+    [stageRuntimeScriptPath, "--staging-root", missingRoot],
+    { cwd: scriptsDirectory, encoding: "utf8" },
+  );
 
   assert.notEqual(result.status, 0);
   assert.equal(result.stdout, "");

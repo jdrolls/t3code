@@ -17,7 +17,7 @@ import {
 } from "./lib/cli-external-packages.mjs";
 import { SERVICE_LAUNCHER_PROTOCOL } from "./lib/service-launcher-protocol.mjs";
 
-export const RELEASE_VERSION = "0.0.39";
+export const RELEASE_VERSION = "0.0.40-fork.5";
 export const FORK_REPOSITORY_URL = "https://github.com/jdrolls/t3code";
 const RELEASE_ENTRY_PATH = Path.join("node_modules", "t3", "dist", "bin.mjs");
 const SENTINEL_FILE = ".install-complete";
@@ -30,7 +30,9 @@ function isRecord(value) {
 function packageDependencyNames(packageJson) {
   return new Set([
     ...Object.keys(isRecord(packageJson.dependencies) ? packageJson.dependencies : {}),
-    ...Object.keys(isRecord(packageJson.optionalDependencies) ? packageJson.optionalDependencies : {}),
+    ...Object.keys(
+      isRecord(packageJson.optionalDependencies) ? packageJson.optionalDependencies : {},
+    ),
     ...Object.keys(isRecord(packageJson.peerDependencies) ? packageJson.peerDependencies : {}),
   ]);
 }
@@ -99,7 +101,12 @@ function assertSafePackageName(packageName) {
 
 function isPathInside(parentPath, candidatePath) {
   const relative = Path.relative(parentPath, candidatePath);
-  return relative !== "" && !relative.startsWith(`..${Path.sep}`) && relative !== ".." && !Path.isAbsolute(relative);
+  return (
+    relative !== "" &&
+    !relative.startsWith(`..${Path.sep}`) &&
+    relative !== ".." &&
+    !Path.isAbsolute(relative)
+  );
 }
 
 function packageTarget(parentNodeModules, packageName) {
@@ -150,7 +157,9 @@ async function resolveDirectNodeModulesPackageRoot(fromPackageRoot, dependencyNa
     Fs.realpath(candidateRoot),
   ]);
   if (!candidateStats.isDirectory() && !candidateStats.isSymbolicLink()) {
-    throw new Error(`Direct node_modules package path for '${dependencyName}' is not a directory or symlink.`);
+    throw new Error(
+      `Direct node_modules package path for '${dependencyName}' is not a directory or symlink.`,
+    );
   }
 
   const canonicalStats = await Fs.stat(canonicalPackageRoot);
@@ -178,7 +187,9 @@ export async function resolvePackageRoot(fromPackageRoot, dependencyName) {
   assertSafePackageName(dependencyName);
   const requireFromPackage = createRequire(Path.join(fromPackageRoot, "package.json"));
   try {
-    return await Fs.realpath(Path.dirname(requireFromPackage.resolve(`${dependencyName}/package.json`)));
+    return await Fs.realpath(
+      Path.dirname(requireFromPackage.resolve(`${dependencyName}/package.json`)),
+    );
   } catch (packageJsonCause) {
     try {
       return await findPackageRoot(requireFromPackage.resolve(dependencyName), dependencyName);
@@ -228,7 +239,10 @@ async function copyPackageTree(input) {
     }
     // A cyclic dependency is already available at its ancestor destination.
     if (ancestors.has(dependencySourceRoot)) continue;
-    const dependencyTargetRoot = packageTarget(Path.join(targetRoot, "node_modules"), dependencyName);
+    const dependencyTargetRoot = packageTarget(
+      Path.join(targetRoot, "node_modules"),
+      dependencyName,
+    );
     await Fs.mkdir(Path.dirname(dependencyTargetRoot), { recursive: true });
     await copyPackageTree({
       sourceRoot: dependencySourceRoot,
@@ -251,7 +265,9 @@ function runNode(args) {
     child.stderr.on("data", (chunk) => {
       stderr += chunk;
     });
-    child.once("error", (cause) => reject(new Error(`Could not run Node verification: ${cause.message}`)));
+    child.once("error", (cause) =>
+      reject(new Error(`Could not run Node verification: ${cause.message}`)),
+    );
     child.once("exit", (code, signal) => {
       if (code === 0) {
         resolve({ stdout, stderr });
@@ -269,7 +285,9 @@ function runNode(args) {
 async function verifyStagedRuntime(entryPath, preflightDatabasePath) {
   const version = await runNode([entryPath, "--version"]);
   if (!version.stdout.includes(RELEASE_VERSION)) {
-    throw new Error(`Staged executable did not report ${RELEASE_VERSION}: ${version.stdout.trim()}`);
+    throw new Error(
+      `Staged executable did not report ${RELEASE_VERSION}: ${version.stdout.trim()}`,
+    );
   }
   const preflight = await runNode([
     entryPath,
@@ -297,13 +315,17 @@ async function verifyStagedRuntime(entryPath, preflightDatabasePath) {
 
 export async function stageRuntime(rawStagingRoot) {
   const stagingRoot = await canonicalStagingRoot(rawStagingRoot);
-  const repositoryRoot = await Fs.realpath(Path.resolve(Path.dirname(fileURLToPath(import.meta.url)), ".."));
+  const repositoryRoot = await Fs.realpath(
+    Path.resolve(Path.dirname(fileURLToPath(import.meta.url)), ".."),
+  );
   const serverRoot = Path.join(repositoryRoot, "apps", "server");
   const sourcePackage = validateSourcePackage(await readPackageJson(serverRoot));
   const sourceDist = Path.join(serverRoot, "dist");
   const sourceEntry = Path.join(sourceDist, "bin.mjs");
   if (!(await Fs.stat(sourceEntry)).isFile()) {
-    throw new Error("Missing apps/server/dist/bin.mjs. Run `bun --cwd apps/server run build:bundle` first.");
+    throw new Error(
+      "Missing apps/server/dist/bin.mjs. Run `bun --cwd apps/server run build:bundle` first.",
+    );
   }
 
   const versionRoot = Path.join(stagingRoot, "runtime", "versions", RELEASE_VERSION);
@@ -323,14 +345,23 @@ export async function stageRuntime(rawStagingRoot) {
       errorOnExist: true,
       force: false,
     });
-    await Fs.writeFile(Path.join(stagePackageRoot, "package.json"), `${JSON.stringify(sourcePackage, null, 2)}\n`, {
-      mode: 0o600,
-    });
+    await Fs.writeFile(
+      Path.join(stagePackageRoot, "package.json"),
+      `${JSON.stringify(sourcePackage, null, 2)}\n`,
+      {
+        mode: 0o600,
+      },
+    );
 
-    const directRuntimeDependencies = selectCliRuntimeExternalDependencies(sourcePackage.dependencies);
+    const directRuntimeDependencies = selectCliRuntimeExternalDependencies(
+      sourcePackage.dependencies,
+    );
     for (const dependencyName of Object.keys(directRuntimeDependencies).sort()) {
       const dependencySourceRoot = await resolvePackageRoot(serverRoot, dependencyName);
-      const dependencyTargetRoot = packageTarget(Path.join(versionRoot, "node_modules"), dependencyName);
+      const dependencyTargetRoot = packageTarget(
+        Path.join(versionRoot, "node_modules"),
+        dependencyName,
+      );
       await Fs.mkdir(Path.dirname(dependencyTargetRoot), { recursive: true });
       await copyPackageTree({
         sourceRoot: dependencySourceRoot,
@@ -340,7 +371,10 @@ export async function stageRuntime(rawStagingRoot) {
     }
     // Keep the runtime dependency policy load-bearing: an empty selection here
     // would make a superficially valid but non-runnable artifact.
-    if (Object.keys(directRuntimeDependencies).length === 0 || CLI_RUNTIME_EXTERNAL_PREFIXES.length === 0) {
+    if (
+      Object.keys(directRuntimeDependencies).length === 0 ||
+      CLI_RUNTIME_EXTERNAL_PREFIXES.length === 0
+    ) {
       throw new Error("No runtime external dependencies were selected for staging.");
     }
 
@@ -356,7 +390,9 @@ export async function stageRuntime(rawStagingRoot) {
     } finally {
       await Fs.rm(preflightRoot, { recursive: true, force: true });
     }
-    await Fs.writeFile(Path.join(versionRoot, SENTINEL_FILE), `${RELEASE_VERSION}\n`, { mode: 0o600 });
+    await Fs.writeFile(Path.join(versionRoot, SENTINEL_FILE), `${RELEASE_VERSION}\n`, {
+      mode: 0o600,
+    });
   } catch (cause) {
     await Fs.rm(versionRoot, { recursive: true, force: true });
     throw cause;
@@ -371,7 +407,9 @@ export async function stageRuntime(rawStagingRoot) {
 
 function parseArgs(argv) {
   if (argv.length !== 2 || argv[0] !== "--staging-root") {
-    throw new Error("Usage: node scripts/stage-t3-runtime.mjs --staging-root <absolute-empty-directory>");
+    throw new Error(
+      "Usage: node scripts/stage-t3-runtime.mjs --staging-root <absolute-empty-directory>",
+    );
   }
   return argv[1];
 }

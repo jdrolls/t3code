@@ -28,7 +28,8 @@ const isDoraClientThreadActivityAppendCommand = Schema.is(DoraClientThreadActivi
 
 const isDoraControlPlaneActivity = (
   command: OrchestrationCommand,
-): command is DoraClientThreadActivityAppendCommand => isDoraClientThreadActivityAppendCommand(command);
+): command is DoraClientThreadActivityAppendCommand =>
+  isDoraClientThreadActivityAppendCommand(command);
 
 export const orchestrationHttpApiLayer = HttpApiBuilder.group(
   EnvironmentHttpApi,
