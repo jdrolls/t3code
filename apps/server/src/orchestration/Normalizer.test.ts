@@ -13,6 +13,7 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 
 import * as ServerConfig from "../config.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
@@ -275,7 +276,9 @@ describe("normalizeDispatchCommand Dora activities", () => {
             four: "x".repeat(4_096),
             five: "x".repeat(4_096),
           }),
-          doraActivityCommand(JSON.parse('{"__proto__":"unsafe"}')),
+          doraActivityCommand(
+            Schema.decodeUnknownSync(Schema.UnknownFromJsonString)('{"__proto__":"unsafe"}'),
+          ),
           doraActivityCommand({ count: Number.NaN }),
         ];
 
