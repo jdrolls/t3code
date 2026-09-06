@@ -1,5 +1,5 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it } from "@effect/vitest";
 import {
   CommandId,
   type ClientOrchestrationCommand,
@@ -169,115 +169,122 @@ function doraActivityCommand(payload: unknown): DoraActivityAppendCommand {
 }
 
 describe("normalizeDispatchCommand Dora activities", () => {
-  it("normalizes a valid externally dispatched Dora activity", async () => {
-    const normalized = await Effect.runPromise(
-      normalizeDispatchCommand(
-        doraActivityCommand({ plan: ["inspect", "verify"], attempts: 1 }),
-      ).pipe(Effect.provide(testLayer)),
-    );
-    if (!isNormalizedDoraActivityAppendCommand(normalized)) {
-      throw new Error("Expected a Dora activity append command.");
-    }
-    expect(normalized.providerInstanceId).toBe("dora");
-    expect(normalized.providerSessionId).toBe("dora-session-1");
-    expect(normalized.activity.createdAt).not.toBe(clientCreatedAt);
-  });
-
-  it("validates recursive bounds and rejects secret-bearing summaries and payloads", () => {
-    const validActivity = activityOf(
-      doraActivityCommand({ plan: ["inspect", "verify"], attempts: 1 }),
-    );
-    expect(validateDoraActivity(validActivity)).toBeUndefined();
-    expect(
-      validateDoraActivity({
-        ...validActivity,
-        payload: { one: { two: { three: { four: { five: { six: "too deep" } } } } } },
+  it.layer(testLayer)((it) => {
+    it.effect("normalizes a valid externally dispatched Dora activity", () =>
+      Effect.gen(function* () {
+        const normalized = yield* normalizeDispatchCommand(
+          doraActivityCommand({ plan: ["inspect", "verify"], attempts: 1 }),
+        );
+        if (!isNormalizedDoraActivityAppendCommand(normalized)) {
+          throw new Error("Expected a Dora activity append command.");
+        }
+        expect(normalized.providerInstanceId).toBe("dora");
+        expect(normalized.providerSessionId).toBe("dora-session-1");
+        expect(normalized.activity.createdAt).not.toBe(clientCreatedAt);
       }),
-    ).toContain("maximum depth");
-    expect(validateDoraActivity({ ...validActivity, summary: "token: secret-value" })).toContain(
-      "secret-bearing",
-    );
-    expect(
-      validateDoraActivity({ ...validActivity, payload: { authorization: "Bearer x" } }),
-    ).toContain("secret-bearing");
-    expect(
-      validateDoraActivity({
-        ...validActivity,
-        payload: { diagnostics: { detail: "diagnostic: Bearer abcdefghijklmno" } },
-      }),
-    ).toContain("secret-bearing");
-    expect(
-      validateDoraActivity({
-        ...validActivity,
-        payload: {
-          diagnostics: { detail: "Provider response included Bearer abcdefghijklmno in prose." },
-        },
-      }),
-    ).toContain("secret-bearing");
-  });
-
-  it("rejects a deeply nested payload with a typed validation error before secret scanning", async () => {
-    const payload: Record<string, unknown> = {};
-    let current = payload;
-    for (let depth = 0; depth < 10_000; depth += 1) {
-      const next: Record<string, unknown> = {};
-      current.next = next;
-      current = next;
-    }
-
-    const error = await Effect.runPromise(
-      normalizeDispatchCommand(doraActivityCommand(payload)).pipe(
-        Effect.provide(testLayer),
-        Effect.flip,
-      ),
     );
 
-    expect(error._tag).toBe("OrchestrationDispatchCommandError");
-    expect(error.message).toContain("payload exceeds maximum depth");
-  });
+    it.effect("validates recursive bounds and rejects secret-bearing summaries and payloads", () =>
+      Effect.sync(() => {
+        const validActivity = activityOf(
+          doraActivityCommand({ plan: ["inspect", "verify"], attempts: 1 }),
+        );
+        expect(validateDoraActivity(validActivity)).toBeUndefined();
+        expect(
+          validateDoraActivity({
+            ...validActivity,
+            payload: { one: { two: { three: { four: { five: { six: "too deep" } } } } } },
+          }),
+        ).toContain("maximum depth");
+        expect(
+          validateDoraActivity({ ...validActivity, summary: "token: secret-value" }),
+        ).toContain("secret-bearing");
+        expect(
+          validateDoraActivity({ ...validActivity, payload: { authorization: "Bearer x" } }),
+        ).toContain("secret-bearing");
+        expect(
+          validateDoraActivity({
+            ...validActivity,
+            payload: { diagnostics: { detail: "diagnostic: Bearer abcdefghijklmno" } },
+          }),
+        ).toContain("secret-bearing");
+        expect(
+          validateDoraActivity({
+            ...validActivity,
+            payload: {
+              diagnostics: {
+                detail: "Provider response included Bearer abcdefghijklmno in prose.",
+              },
+            },
+          }),
+        ).toContain("secret-bearing");
+      }),
+    );
 
-  it("rejects non-Dora kinds and unsafe or oversized payloads", async () => {
-    const baseCommand = doraActivityCommand({});
-    const baseActivity = activityOf(baseCommand);
-    const invalidCommands: ClientOrchestrationCommand[] = [
-      ...["tool.completed", "approval.requested", "user-input.requested", "other.kind"].map(
-        (kind) =>
-          ({
+    it.effect(
+      "rejects a deeply nested payload with a typed validation error before secret scanning",
+      () =>
+        Effect.gen(function* () {
+          const payload: Record<string, unknown> = {};
+          let current = payload;
+          for (let depth = 0; depth < 10_000; depth += 1) {
+            const next: Record<string, unknown> = {};
+            current.next = next;
+            current = next;
+          }
+
+          const error = yield* normalizeDispatchCommand(doraActivityCommand(payload)).pipe(
+            Effect.flip,
+          );
+
+          expect(error._tag).toBe("OrchestrationDispatchCommandError");
+          expect(error.message).toContain("payload exceeds maximum depth");
+        }),
+    );
+
+    it.effect("rejects non-Dora kinds and unsafe or oversized payloads", () =>
+      Effect.gen(function* () {
+        const baseCommand = doraActivityCommand({});
+        const baseActivity = activityOf(baseCommand);
+        const invalidCommands: ClientOrchestrationCommand[] = [
+          ...["tool.completed", "approval.requested", "user-input.requested", "other.kind"].map(
+            (kind) =>
+              ({
+                ...baseCommand,
+                activity: { ...baseActivity, kind },
+              }) as unknown as ClientOrchestrationCommand,
+          ),
+          {
             ...baseCommand,
-            activity: { ...baseActivity, kind },
-          }) as unknown as ClientOrchestrationCommand,
-      ),
-      {
-        ...baseCommand,
-        activity: { ...baseActivity, tone: "approval" },
-      } as unknown as ClientOrchestrationCommand,
-      {
-        ...baseCommand,
-        activity: { ...baseActivity, turnId: "turn-1" },
-      } as unknown as ClientOrchestrationCommand,
-      {
-        ...baseCommand,
-        activity: { ...baseActivity, summary: "x".repeat(2_001) },
-      } as unknown as ClientOrchestrationCommand,
-      doraActivityCommand(["not-a-record"]),
-      doraActivityCommand({ detail: "x".repeat(4_097) }),
-      doraActivityCommand({
-        one: "x".repeat(4_096),
-        two: "x".repeat(4_096),
-        three: "x".repeat(4_096),
-        four: "x".repeat(4_096),
-        five: "x".repeat(4_096),
-      }),
-      doraActivityCommand(JSON.parse('{"__proto__":"unsafe"}')),
-      doraActivityCommand({ count: Number.NaN }),
-    ];
+            activity: { ...baseActivity, tone: "approval" },
+          } as unknown as ClientOrchestrationCommand,
+          {
+            ...baseCommand,
+            activity: { ...baseActivity, turnId: "turn-1" },
+          } as unknown as ClientOrchestrationCommand,
+          {
+            ...baseCommand,
+            activity: { ...baseActivity, summary: "x".repeat(2_001) },
+          } as unknown as ClientOrchestrationCommand,
+          doraActivityCommand(["not-a-record"]),
+          doraActivityCommand({ detail: "x".repeat(4_097) }),
+          doraActivityCommand({
+            one: "x".repeat(4_096),
+            two: "x".repeat(4_096),
+            three: "x".repeat(4_096),
+            four: "x".repeat(4_096),
+            five: "x".repeat(4_096),
+          }),
+          doraActivityCommand(JSON.parse('{"__proto__":"unsafe"}')),
+          doraActivityCommand({ count: Number.NaN }),
+        ];
 
-    for (const command of invalidCommands) {
-      const error = await Effect.runPromise(
-        normalizeDispatchCommand(command).pipe(Effect.provide(testLayer), Effect.flip),
-      );
-      expect(error._tag).toBe("OrchestrationDispatchCommandError");
-      expect(error.message).toContain("Invalid Dora activity:");
-    }
+        for (const command of invalidCommands) {
+          const error = yield* normalizeDispatchCommand(command).pipe(Effect.flip);
+          expect(error._tag).toBe("OrchestrationDispatchCommandError");
+          expect(error.message).toContain("Invalid Dora activity:");
+        }
+      }),
+    );
   });
 });

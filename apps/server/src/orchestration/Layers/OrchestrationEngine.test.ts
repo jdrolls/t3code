@@ -604,145 +604,151 @@ describe("OrchestrationEngine", () => {
     await runtime.dispose();
   });
 
-  it("reconciles non-stale Dora session bindings and rejects reconciliation failures", async () => {
-    const threadId = ThreadId.make("thread-dora-reconciliation");
-    const providerInstanceId = ProviderInstanceId.make("dora");
-    const providerSessionId = ProviderSessionId.make("dora-session-reconciliation");
-    const capability = createAuthenticatedDoraActivityCapability({
-      threadId,
-      providerInstanceId,
-      providerSessionId,
-    });
-    const activity = (commandId: CommandId) => ({
-      type: "thread.activity.append" as const,
-      commandId,
-      threadId,
-      providerInstanceId,
-      providerSessionId,
-      activity: {
-        id: EventId.make(`activity-${commandId}`),
-        tone: "info" as const,
-        kind: "dora.plan" as const,
-        summary: "Plan completed",
-        payload: {},
-        turnId: null,
-        createdAt: now(),
-      },
-      createdAt: now(),
-    });
+  effectIt.effect(
+    "reconciles non-stale Dora session bindings and rejects reconciliation failures",
+    () =>
+      Effect.promise(async () => {
+        const threadId = ThreadId.make("thread-dora-reconciliation");
+        const providerInstanceId = ProviderInstanceId.make("dora");
+        const providerSessionId = ProviderSessionId.make("dora-session-reconciliation");
+        const capability = createAuthenticatedDoraActivityCapability({
+          threadId,
+          providerInstanceId,
+          providerSessionId,
+        });
+        const activity = (commandId: CommandId) => ({
+          type: "thread.activity.append" as const,
+          commandId,
+          threadId,
+          providerInstanceId,
+          providerSessionId,
+          activity: {
+            id: EventId.make(`activity-${commandId}`),
+            tone: "info" as const,
+            kind: "dora.plan" as const,
+            summary: "Plan completed",
+            payload: {},
+            turnId: null,
+            createdAt: now(),
+          },
+          createdAt: now(),
+        });
 
-    const reconciled = makeDoraReconciliationRuntime([
-      makeDoraCommandReadModel(7, "absent"),
-      makeDoraCommandReadModel(8, "bound"),
-    ]);
-    try {
-      const engine = await reconciled.runtime.runPromise(
-        Effect.service(OrchestrationEngineService),
-      );
-      const accepted = await reconciled.runtime.runPromise(
-        engine.dispatch(activity(CommandId.make("cmd-dora-reconciliation-accepted")), {
-          doraActivityCapability: capability,
-        }),
-      );
-      expect(accepted.sequence).toBe(9);
-      expect(await reconciled.runtime.runPromise(engine.latestSequence)).toBe(9);
-      expect(reconciled.commandReadModelReads()).toBe(2);
-      expect(reconciled.appendCount()).toBe(1);
-    } finally {
-      await reconciled.runtime.dispose();
-    }
+        const reconciled = makeDoraReconciliationRuntime([
+          makeDoraCommandReadModel(7, "absent"),
+          makeDoraCommandReadModel(8, "bound"),
+        ]);
+        try {
+          const engine = await reconciled.runtime.runPromise(
+            Effect.service(OrchestrationEngineService),
+          );
+          const accepted = await reconciled.runtime.runPromise(
+            engine.dispatch(activity(CommandId.make("cmd-dora-reconciliation-accepted")), {
+              doraActivityCapability: capability,
+            }),
+          );
+          expect(accepted.sequence).toBe(9);
+          expect(await reconciled.runtime.runPromise(engine.latestSequence)).toBe(9);
+          expect(reconciled.commandReadModelReads()).toBe(2);
+          expect(reconciled.appendCount()).toBe(1);
+        } finally {
+          await reconciled.runtime.dispose();
+        }
 
-    const equalSequence = makeDoraReconciliationRuntime([
-      makeDoraCommandReadModel(7, "absent"),
-      makeDoraCommandReadModel(7, "bound"),
-    ]);
-    try {
-      const engine = await equalSequence.runtime.runPromise(
-        Effect.service(OrchestrationEngineService),
-      );
-      const accepted = await equalSequence.runtime.runPromise(
-        engine.dispatch(activity(CommandId.make("cmd-dora-reconciliation-equal")), {
-          doraActivityCapability: capability,
-        }),
-      );
-      expect(accepted.sequence).toBe(8);
-      expect(await equalSequence.runtime.runPromise(engine.latestSequence)).toBe(8);
-      expect(equalSequence.commandReadModelReads()).toBe(2);
-      expect(equalSequence.appendCount()).toBe(1);
-    } finally {
-      await equalSequence.runtime.dispose();
-    }
+        const equalSequence = makeDoraReconciliationRuntime([
+          makeDoraCommandReadModel(7, "absent"),
+          makeDoraCommandReadModel(7, "bound"),
+        ]);
+        try {
+          const engine = await equalSequence.runtime.runPromise(
+            Effect.service(OrchestrationEngineService),
+          );
+          const accepted = await equalSequence.runtime.runPromise(
+            engine.dispatch(activity(CommandId.make("cmd-dora-reconciliation-equal")), {
+              doraActivityCapability: capability,
+            }),
+          );
+          expect(accepted.sequence).toBe(8);
+          expect(await equalSequence.runtime.runPromise(engine.latestSequence)).toBe(8);
+          expect(equalSequence.commandReadModelReads()).toBe(2);
+          expect(equalSequence.appendCount()).toBe(1);
+        } finally {
+          await equalSequence.runtime.dispose();
+        }
 
-    const stale = makeDoraReconciliationRuntime([
-      makeDoraCommandReadModel(7, "absent"),
-      makeDoraCommandReadModel(6, "bound"),
-    ]);
-    try {
-      const engine = await stale.runtime.runPromise(Effect.service(OrchestrationEngineService));
-      const commandId = CommandId.make("cmd-dora-reconciliation-stale");
-      await expect(
-        stale.runtime.runPromise(
-          engine.dispatch(activity(commandId), { doraActivityCapability: capability }),
-        ),
-      ).rejects.toThrow("Dora activity does not match an active bound Dora session.");
-      const receipts = await stale.runtime.runPromise(
-        Effect.service(OrchestrationCommandReceipts.OrchestrationCommandReceiptRepository),
-      );
-      expect(
-        Option.getOrNull(await stale.runtime.runPromise(receipts.getByCommandId({ commandId }))),
-      ).toMatchObject({
-        commandId,
-        aggregateKind: "thread",
-        aggregateId: threadId,
-        status: "rejected",
-        resultSequence: 7,
-      });
-      expect(await stale.runtime.runPromise(engine.latestSequence)).toBe(7);
-      expect(stale.commandReadModelReads()).toBe(2);
-      expect(stale.appendCount()).toBe(0);
-    } finally {
-      await stale.runtime.dispose();
-    }
+        const stale = makeDoraReconciliationRuntime([
+          makeDoraCommandReadModel(7, "absent"),
+          makeDoraCommandReadModel(6, "bound"),
+        ]);
+        try {
+          const engine = await stale.runtime.runPromise(Effect.service(OrchestrationEngineService));
+          const commandId = CommandId.make("cmd-dora-reconciliation-stale");
+          await expect(
+            stale.runtime.runPromise(
+              engine.dispatch(activity(commandId), { doraActivityCapability: capability }),
+            ),
+          ).rejects.toThrow("Dora activity does not match an active bound Dora session.");
+          const receipts = await stale.runtime.runPromise(
+            Effect.service(OrchestrationCommandReceipts.OrchestrationCommandReceiptRepository),
+          );
+          expect(
+            Option.getOrNull(
+              await stale.runtime.runPromise(receipts.getByCommandId({ commandId })),
+            ),
+          ).toMatchObject({
+            commandId,
+            aggregateKind: "thread",
+            aggregateId: threadId,
+            status: "rejected",
+            resultSequence: 7,
+          });
+          expect(await stale.runtime.runPromise(engine.latestSequence)).toBe(7);
+          expect(stale.commandReadModelReads()).toBe(2);
+          expect(stale.appendCount()).toBe(0);
+        } finally {
+          await stale.runtime.dispose();
+        }
 
-    const readFailure = makeDoraReconciliationRuntime([makeDoraCommandReadModel(7, "absent")], {
-      reconciliationReadError: new PersistenceSqlError({
-        operation: "test.dora-reconciliation-read",
-        detail: "projection unavailable",
+        const readFailure = makeDoraReconciliationRuntime([makeDoraCommandReadModel(7, "absent")], {
+          reconciliationReadError: new PersistenceSqlError({
+            operation: "test.dora-reconciliation-read",
+            detail: "projection unavailable",
+          }),
+        });
+        try {
+          const engine = await readFailure.runtime.runPromise(
+            Effect.service(OrchestrationEngineService),
+          );
+          const commandId = CommandId.make("cmd-dora-reconciliation-read-failure");
+          await expect(
+            readFailure.runtime.runPromise(
+              engine.dispatch(activity(commandId), { doraActivityCapability: capability }),
+            ),
+          ).rejects.toThrow("Dora activity does not match an active bound Dora session.");
+          const receipts = await readFailure.runtime.runPromise(
+            Effect.service(OrchestrationCommandReceipts.OrchestrationCommandReceiptRepository),
+          );
+          expect(
+            Option.getOrNull(
+              await readFailure.runtime.runPromise(receipts.getByCommandId({ commandId })),
+            ),
+          ).toMatchObject({
+            commandId,
+            aggregateKind: "thread",
+            aggregateId: threadId,
+            status: "rejected",
+            error:
+              "Orchestration command invariant failed (thread.activity.append): Dora activity does not match an active bound Dora session.",
+            resultSequence: 7,
+          });
+          expect(await readFailure.runtime.runPromise(engine.latestSequence)).toBe(7);
+          expect(readFailure.commandReadModelReads()).toBe(2);
+          expect(readFailure.appendCount()).toBe(0);
+        } finally {
+          await readFailure.runtime.dispose();
+        }
       }),
-    });
-    try {
-      const engine = await readFailure.runtime.runPromise(
-        Effect.service(OrchestrationEngineService),
-      );
-      const commandId = CommandId.make("cmd-dora-reconciliation-read-failure");
-      await expect(
-        readFailure.runtime.runPromise(
-          engine.dispatch(activity(commandId), { doraActivityCapability: capability }),
-        ),
-      ).rejects.toThrow("Dora activity does not match an active bound Dora session.");
-      const receipts = await readFailure.runtime.runPromise(
-        Effect.service(OrchestrationCommandReceipts.OrchestrationCommandReceiptRepository),
-      );
-      expect(
-        Option.getOrNull(
-          await readFailure.runtime.runPromise(receipts.getByCommandId({ commandId })),
-        ),
-      ).toMatchObject({
-        commandId,
-        aggregateKind: "thread",
-        aggregateId: threadId,
-        status: "rejected",
-        error:
-          "Orchestration command invariant failed (thread.activity.append): Dora activity does not match an active bound Dora session.",
-        resultSequence: 7,
-      });
-      expect(await readFailure.runtime.runPromise(engine.latestSequence)).toBe(7);
-      expect(readFailure.commandReadModelReads()).toBe(2);
-      expect(readFailure.appendCount()).toBe(0);
-    } finally {
-      await readFailure.runtime.dispose();
-    }
-  });
+  );
 
   effectIt.effect("preserves the blocked-settle error and persists its rejected receipt", () =>
     Effect.gen(function* () {
@@ -1733,7 +1739,7 @@ describe("OrchestrationEngine", () => {
     await runtime.dispose();
   });
 
-  it("reconciles command state when append persists but projection fails", async () => {
+  effectIt.effect("reconciles command state when append persists but projection fails", () => {
     type StoredEvent =
       ReturnType<OrchestrationEventStoreShape["append"]> extends Effect.Effect<infer A, any, any>
         ? A
@@ -1781,24 +1787,11 @@ describe("OrchestrationEngine", () => {
       },
     };
 
-    const runtime = ManagedRuntime.make(
-      OrchestrationEngineLive.pipe(
-        Layer.provide(OrchestrationProjectionSnapshotQueryLive),
-        Layer.provide(ThreadBackgroundLiveness.layer),
-        Layer.provide(ThreadPlanProgress.layer),
-        Layer.provide(Layer.succeed(OrchestrationProjectionPipeline, flakyProjectionPipeline)),
-        Layer.provide(Layer.succeed(OrchestrationEventStore, nonTransactionalStore)),
-        Layer.provide(OrchestrationCommandReceiptRepositoryLive),
-        Layer.provide(RepositoryIdentityResolver.layer),
-        Layer.provide(SqlitePersistenceMemory),
-        Layer.provide(NodeServices.layer),
-      ),
-    );
-    const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
-    const createdAt = now();
+    return Effect.gen(function* () {
+      const engine = yield* Effect.service(OrchestrationEngineService);
+      const createdAt = now();
 
-    await runtime.runPromise(
-      engine.dispatch({
+      yield* engine.dispatch({
         type: "project.create",
         commandId: CommandId.make("cmd-project-sync-create"),
         projectId: asProjectId("project-sync"),
@@ -1809,10 +1802,8 @@ describe("OrchestrationEngine", () => {
           model: "gpt-5-codex",
         },
         createdAt,
-      }),
-    );
-    await runtime.runPromise(
-      engine.dispatch({
+      });
+      yield* engine.dispatch({
         type: "thread.create",
         commandId: CommandId.make("cmd-thread-sync-create"),
         threadId: ThreadId.make("thread-sync"),
@@ -1827,30 +1818,40 @@ describe("OrchestrationEngine", () => {
         branch: null,
         worktreePath: null,
         createdAt,
-      }),
-    );
+      });
 
-    await expect(
-      runtime.runPromise(
-        engine.dispatch({
+      const projectionError = yield* engine
+        .dispatch({
           type: "thread.archive",
           commandId: CommandId.make("cmd-thread-archive-sync-fail"),
           threadId: ThreadId.make("thread-sync"),
-        }),
-      ),
-    ).rejects.toThrow("projection failed");
+        })
+        .pipe(Effect.flip);
+      expect(projectionError.message).toContain("projection failed");
 
-    await expect(
-      runtime.runPromise(
-        engine.dispatch({
+      const retryError = yield* engine
+        .dispatch({
           type: "thread.archive",
           commandId: CommandId.make("cmd-thread-archive-sync-retry"),
           threadId: ThreadId.make("thread-sync"),
-        }),
+        })
+        .pipe(Effect.flip);
+      expect(retryError.message).toContain("already archived");
+    }).pipe(
+      Effect.provide(
+        OrchestrationEngineLive.pipe(
+          Layer.provide(OrchestrationProjectionSnapshotQueryLive),
+          Layer.provide(ThreadBackgroundLiveness.layer),
+          Layer.provide(ThreadPlanProgress.layer),
+          Layer.provide(Layer.succeed(OrchestrationProjectionPipeline, flakyProjectionPipeline)),
+          Layer.provide(Layer.succeed(OrchestrationEventStore, nonTransactionalStore)),
+          Layer.provide(OrchestrationCommandReceiptRepositoryLive),
+          Layer.provide(RepositoryIdentityResolver.layer),
+          Layer.provide(SqlitePersistenceMemory),
+          Layer.provide(NodeServices.layer),
+        ),
       ),
-    ).rejects.toThrow("already archived");
-
-    await runtime.dispose();
+    );
   });
 
   it("fails command dispatch when command invariants are violated", async () => {
@@ -2142,176 +2143,187 @@ describe("OrchestrationEngine", () => {
     await system.dispose();
   });
 
-  it("accepts Dora activities only through a session-bound trusted provider capability", async () => {
-    const system = await createOrchestrationSystem();
-    const { engine } = system;
-    const projectId = ProjectId.make("project-dora-boundary");
-    const threadId = ThreadId.make("thread-dora-boundary");
-    const createdAt = "2026-01-01T00:00:00.000Z";
-    const providerInstanceId = ProviderInstanceId.make("dora");
-    const providerSessionId = ProviderSessionId.make("dora-session-1");
-    const activity = (
-      kind: "dora.plan" | "dora.replan" | "dora.verification" | "dora.side-effect",
-      commandId: CommandId,
-    ) => ({
-      type: "thread.activity.append" as const,
-      commandId,
-      threadId,
-      providerInstanceId,
-      providerSessionId,
-      activity: {
-        id: EventId.make(`activity-${kind}`),
-        tone: "info" as const,
-        kind,
-        summary: `${kind} completed`,
-        payload: { steps: ["inspect", "verify"] },
-        turnId: null,
-        createdAt: "2031-01-01T00:00:00.000Z",
-      },
-      createdAt: "2031-01-01T00:00:00.000Z",
-    });
-    try {
-      await system.run(
-        engine.dispatch({
-          type: "project.create",
-          commandId: CommandId.make("cmd-dora-project"),
-          projectId,
-          title: "Dora project",
-          workspaceRoot: "/tmp/dora-boundary",
-          createdAt,
-        }),
-      );
-      await system.run(
-        engine.dispatch({
-          type: "thread.create",
-          commandId: CommandId.make("cmd-dora-thread"),
+  effectIt.effect(
+    "accepts Dora activities only through a session-bound trusted provider capability",
+    () =>
+      Effect.promise(async () => {
+        const system = await createOrchestrationSystem();
+        const { engine } = system;
+        const projectId = ProjectId.make("project-dora-boundary");
+        const threadId = ThreadId.make("thread-dora-boundary");
+        const createdAt = "2026-01-01T00:00:00.000Z";
+        const providerInstanceId = ProviderInstanceId.make("dora");
+        const providerSessionId = ProviderSessionId.make("dora-session-1");
+        const activity = (
+          kind: "dora.plan" | "dora.replan" | "dora.verification" | "dora.side-effect",
+          commandId: CommandId,
+        ) => ({
+          type: "thread.activity.append" as const,
+          commandId,
           threadId,
-          projectId,
-          title: "Dora thread",
-          modelSelection: { instanceId: providerInstanceId, model: "dora" },
-          runtimeMode: "full-access",
-          interactionMode: "default",
-          branch: null,
-          worktreePath: null,
-          createdAt,
-        }),
-      );
+          providerInstanceId,
+          providerSessionId,
+          activity: {
+            id: EventId.make(`activity-${kind}`),
+            tone: "info" as const,
+            kind,
+            summary: `${kind} completed`,
+            payload: { steps: ["inspect", "verify"] },
+            turnId: null,
+            createdAt: "2031-01-01T00:00:00.000Z",
+          },
+          createdAt: "2031-01-01T00:00:00.000Z",
+        });
+        try {
+          await system.run(
+            engine.dispatch({
+              type: "project.create",
+              commandId: CommandId.make("cmd-dora-project"),
+              projectId,
+              title: "Dora project",
+              workspaceRoot: "/tmp/dora-boundary",
+              createdAt,
+            }),
+          );
+          await system.run(
+            engine.dispatch({
+              type: "thread.create",
+              commandId: CommandId.make("cmd-dora-thread"),
+              threadId,
+              projectId,
+              title: "Dora thread",
+              modelSelection: { instanceId: providerInstanceId, model: "dora" },
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: null,
+              createdAt,
+            }),
+          );
 
-      await expect(
-        system.run(
-          engine.dispatch(activity("dora.plan", CommandId.make("cmd-dora-plan-unauthenticated"))),
-        ),
-      ).rejects.toThrow("authenticated control-plane capability");
+          await expect(
+            system.run(
+              engine.dispatch(
+                activity("dora.plan", CommandId.make("cmd-dora-plan-unauthenticated")),
+              ),
+            ),
+          ).rejects.toThrow("authenticated control-plane capability");
 
-      await system.run(
-        engine.dispatch({
-          type: "thread.session.set",
-          commandId: CommandId.make("cmd-dora-session"),
-          threadId,
-          createdAt,
-          session: {
+          await system.run(
+            engine.dispatch({
+              type: "thread.session.set",
+              commandId: CommandId.make("cmd-dora-session"),
+              threadId,
+              createdAt,
+              session: {
+                threadId,
+                status: "ready",
+                providerName: "dora",
+                providerInstanceId,
+                providerSessionId,
+                runtimeMode: "full-access",
+                activeTurnId: null,
+                lastError: null,
+                updatedAt: createdAt,
+              },
+            }),
+          );
+          const capability = createAuthenticatedDoraActivityCapability({
             threadId,
-            status: "ready",
-            providerName: "dora",
             providerInstanceId,
             providerSessionId,
-            runtimeMode: "full-access",
-            activeTurnId: null,
-            lastError: null,
-            updatedAt: createdAt,
-          },
-        }),
-      );
-      const capability = createAuthenticatedDoraActivityCapability({
-        threadId,
-        providerInstanceId,
-        providerSessionId,
-      });
-      await expect(
-        system.run(
-          engine.dispatch(activity("dora.plan", CommandId.make("cmd-dora-plan-wrong-session")), {
-            doraActivityCapability: createAuthenticatedDoraActivityCapability({
-              threadId,
-              providerInstanceId,
-              providerSessionId: ProviderSessionId.make("wrong-session"),
-            }),
-          }),
-        ),
-      ).rejects.toThrow("Dora activity does not carry the authenticated provider session binding.");
-      for (const kind of [
-        "dora.plan",
-        "dora.replan",
-        "dora.verification",
-        "dora.side-effect",
-      ] as const) {
-        await system.run(
-          engine.dispatch(activity(kind, CommandId.make(`cmd-dora-${kind}-accepted`)), {
-            doraActivityCapability: capability,
-          }),
-        );
-      }
-      const events = await system.run(
-        Stream.runCollect(engine.readEvents(0)).pipe(Effect.map((chunk) => Array.from(chunk))),
-      );
-      const doraActivities = events.filter(
-        (event) =>
-          event.type === "thread.activity-appended" &&
-          event.payload.activity.kind.startsWith("dora."),
-      );
-      expect(doraActivities).toHaveLength(4);
-      for (const event of doraActivities) {
-        if (event.type !== "thread.activity-appended") continue;
-        expect(event.payload.activity.createdAt).toBe(event.occurredAt);
-        expect(event.payload.activity.createdAt).not.toBe("2031-01-01T00:00:00.000Z");
-      }
+          });
+          await expect(
+            system.run(
+              engine.dispatch(
+                activity("dora.plan", CommandId.make("cmd-dora-plan-wrong-session")),
+                {
+                  doraActivityCapability: createAuthenticatedDoraActivityCapability({
+                    threadId,
+                    providerInstanceId,
+                    providerSessionId: ProviderSessionId.make("wrong-session"),
+                  }),
+                },
+              ),
+            ),
+          ).rejects.toThrow(
+            "Dora activity does not carry the authenticated provider session binding.",
+          );
+          for (const kind of [
+            "dora.plan",
+            "dora.replan",
+            "dora.verification",
+            "dora.side-effect",
+          ] as const) {
+            await system.run(
+              engine.dispatch(activity(kind, CommandId.make(`cmd-dora-${kind}-accepted`)), {
+                doraActivityCapability: capability,
+              }),
+            );
+          }
+          const events = await system.run(
+            Stream.runCollect(engine.readEvents(0)).pipe(Effect.map((chunk) => Array.from(chunk))),
+          );
+          const doraActivities = events.filter(
+            (event) =>
+              event.type === "thread.activity-appended" &&
+              event.payload.activity.kind.startsWith("dora."),
+          );
+          expect(doraActivities).toHaveLength(4);
+          for (const event of doraActivities) {
+            if (event.type !== "thread.activity-appended") continue;
+            expect(event.payload.activity.createdAt).toBe(event.occurredAt);
+            expect(event.payload.activity.createdAt).not.toBe("2031-01-01T00:00:00.000Z");
+          }
 
-      const secretBearingActivity = activity("dora.plan", CommandId.make("cmd-dora-secret"));
-      await expect(
-        system.run(
-          engine.dispatch(
-            {
-              ...secretBearingActivity,
-              activity: {
-                ...secretBearingActivity.activity,
-                summary: "authorization: Bearer private-secret",
-              },
-            },
-            { doraActivityCapability: capability },
-          ),
-        ),
-      ).rejects.toThrow("secret-bearing");
+          const secretBearingActivity = activity("dora.plan", CommandId.make("cmd-dora-secret"));
+          await expect(
+            system.run(
+              engine.dispatch(
+                {
+                  ...secretBearingActivity,
+                  activity: {
+                    ...secretBearingActivity.activity,
+                    summary: "authorization: Bearer private-secret",
+                  },
+                },
+                { doraActivityCapability: capability },
+              ),
+            ),
+          ).rejects.toThrow("secret-bearing");
 
-      const excessivelyDeepActivity = activity("dora.plan", CommandId.make("cmd-dora-depth"));
-      await expect(
-        system.run(
-          engine.dispatch(
-            {
-              ...excessivelyDeepActivity,
-              activity: {
-                ...excessivelyDeepActivity.activity,
-                payload: {
-                  one: {
-                    two: {
-                      three: {
-                        four: {
-                          five: { six: "deep" },
+          const excessivelyDeepActivity = activity("dora.plan", CommandId.make("cmd-dora-depth"));
+          await expect(
+            system.run(
+              engine.dispatch(
+                {
+                  ...excessivelyDeepActivity,
+                  activity: {
+                    ...excessivelyDeepActivity.activity,
+                    payload: {
+                      one: {
+                        two: {
+                          three: {
+                            four: {
+                              five: { six: "deep" },
+                            },
+                          },
                         },
                       },
                     },
                   },
                 },
-              },
-            },
-            { doraActivityCapability: capability },
-          ),
-        ),
-      ).rejects.toThrow("maximum depth");
-    } finally {
-      await system.dispose();
-    }
-  });
+                { doraActivityCapability: capability },
+              ),
+            ),
+          ).rejects.toThrow("maximum depth");
+        } finally {
+          await system.dispose();
+        }
+      }),
+  );
 
-  it.each([
+  effectIt.effect.each([
     {
       name: "non-Dora",
       providerName: "codex",
@@ -2327,94 +2339,97 @@ describe("OrchestrationEngine", () => {
     },
   ] as const)(
     "rejects a trusted Dora capability for a $name session",
-    async ({ providerName, providerSessionId, status }) => {
-      const system = await createOrchestrationSystem();
-      const projectId = ProjectId.make(
-        `project-dora-${providerName ?? "absent"}-${status ?? "none"}`,
-      );
-      const threadId = ThreadId.make(`thread-dora-${providerName ?? "absent"}-${status ?? "none"}`);
-      const providerInstanceId = ProviderInstanceId.make("dora");
-      const createdAt = now();
-      try {
-        await system.run(
-          system.engine.dispatch({
-            type: "project.create",
-            commandId: CommandId.make(`cmd-${threadId}-project`),
-            projectId,
-            title: "Project",
-            workspaceRoot: `/tmp/${threadId}`,
-            createdAt,
-          }),
+    ({ providerName, providerSessionId, status }) =>
+      Effect.promise(async () => {
+        const system = await createOrchestrationSystem();
+        const projectId = ProjectId.make(
+          `project-dora-${providerName ?? "absent"}-${status ?? "none"}`,
         );
-        await system.run(
-          system.engine.dispatch({
-            type: "thread.create",
-            commandId: CommandId.make(`cmd-${threadId}-thread`),
-            threadId,
-            projectId,
-            title: "Thread",
-            modelSelection: { instanceId: providerInstanceId, model: "dora" },
-            runtimeMode: "full-access",
-            interactionMode: "default",
-            branch: null,
-            worktreePath: null,
-            createdAt,
-          }),
+        const threadId = ThreadId.make(
+          `thread-dora-${providerName ?? "absent"}-${status ?? "none"}`,
         );
-        if (status !== undefined && providerName !== null && providerSessionId !== undefined) {
+        const providerInstanceId = ProviderInstanceId.make("dora");
+        const createdAt = now();
+        try {
           await system.run(
             system.engine.dispatch({
-              type: "thread.session.set",
-              commandId: CommandId.make(`cmd-${threadId}-session`),
-              threadId,
+              type: "project.create",
+              commandId: CommandId.make(`cmd-${threadId}-project`),
+              projectId,
+              title: "Project",
+              workspaceRoot: `/tmp/${threadId}`,
               createdAt,
-              session: {
-                threadId,
-                status,
-                providerName,
-                providerInstanceId,
-                providerSessionId,
-                runtimeMode: "full-access",
-                activeTurnId: null,
-                lastError: null,
-                updatedAt: createdAt,
-              },
             }),
           );
-        }
-        await expect(
-          system.run(
-            system.engine.dispatch(
-              {
-                type: "thread.activity.append",
-                commandId: CommandId.make(`cmd-${threadId}-activity`),
+          await system.run(
+            system.engine.dispatch({
+              type: "thread.create",
+              commandId: CommandId.make(`cmd-${threadId}-thread`),
+              threadId,
+              projectId,
+              title: "Thread",
+              modelSelection: { instanceId: providerInstanceId, model: "dora" },
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: null,
+              createdAt,
+            }),
+          );
+          if (status !== undefined && providerName !== null && providerSessionId !== undefined) {
+            await system.run(
+              system.engine.dispatch({
+                type: "thread.session.set",
+                commandId: CommandId.make(`cmd-${threadId}-session`),
                 threadId,
-                providerInstanceId,
-                providerSessionId: ProviderSessionId.make(providerSessionId ?? "missing"),
-                activity: {
-                  id: EventId.make(`activity-${threadId}`),
-                  tone: "info",
-                  kind: "dora.plan",
-                  summary: "Plan",
-                  payload: {},
-                  turnId: null,
-                  createdAt,
-                },
                 createdAt,
-              },
-              {
-                doraActivityCapability: createAuthenticatedDoraActivityCapability({
+                session: {
+                  threadId,
+                  status,
+                  providerName,
+                  providerInstanceId,
+                  providerSessionId,
+                  runtimeMode: "full-access",
+                  activeTurnId: null,
+                  lastError: null,
+                  updatedAt: createdAt,
+                },
+              }),
+            );
+          }
+          await expect(
+            system.run(
+              system.engine.dispatch(
+                {
+                  type: "thread.activity.append",
+                  commandId: CommandId.make(`cmd-${threadId}-activity`),
                   threadId,
                   providerInstanceId,
                   providerSessionId: ProviderSessionId.make(providerSessionId ?? "missing"),
-                }),
-              },
+                  activity: {
+                    id: EventId.make(`activity-${threadId}`),
+                    tone: "info",
+                    kind: "dora.plan",
+                    summary: "Plan",
+                    payload: {},
+                    turnId: null,
+                    createdAt,
+                  },
+                  createdAt,
+                },
+                {
+                  doraActivityCapability: createAuthenticatedDoraActivityCapability({
+                    threadId,
+                    providerInstanceId,
+                    providerSessionId: ProviderSessionId.make(providerSessionId ?? "missing"),
+                  }),
+                },
+              ),
             ),
-          ),
-        ).rejects.toThrow("active bound Dora session");
-      } finally {
-        await system.dispose();
-      }
-    },
+          ).rejects.toThrow("active bound Dora session");
+        } finally {
+          await system.dispose();
+        }
+      }),
   );
 });

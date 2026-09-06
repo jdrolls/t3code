@@ -18,7 +18,7 @@ import {
   type ProviderDriver,
   type ProviderInstance,
 } from "../ProviderDriver.ts";
-import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
+import type { ServerProviderShape } from "../Services/ServerProvider.ts";
 import { buildServerProvider } from "../providerSnapshot.ts";
 import { makeManualOnlyProviderMaintenanceCapabilities } from "../providerMaintenance.ts";
 
@@ -105,6 +105,8 @@ export const DoraDriver: ProviderDriver<DoraSettings, DoraDriverEnv> = {
           getSnapshot: Effect.succeed(snapshot),
           refresh: Effect.succeed(snapshot),
           streamChanges: Stream.empty,
+          applyUsageLimits: (_update: Parameters<ServerProviderShape["applyUsageLimits"]>[0]) =>
+            Effect.void,
         },
         adapter,
         textGeneration,

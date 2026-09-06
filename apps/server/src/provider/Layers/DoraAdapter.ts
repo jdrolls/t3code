@@ -12,10 +12,10 @@
  * to one canonical T3 thread, worktree, provider instance, and Dora session.
  * See docs/internals/dora-provider.md for the wire contract.
  */
-import { realpath, stat } from "node:fs/promises";
+import * as NodeChildProcess from "node:child_process";
+import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import * as Readline from "node:readline";
+import * as NodeReadline from "node:readline";
 
 import {
   ApprovalRequestId,
@@ -199,8 +199,8 @@ export async function canonicalizeDoraWorktree(cwd: string): Promise<string> {
   if (!trimmed || !NodePath.isAbsolute(trimmed)) {
     throw new Error("Dora requires an absolute worktree path.");
   }
-  const canonical = await realpath(trimmed);
-  if (!(await stat(canonical)).isDirectory()) {
+  const canonical = await NodeFSP.realpath(trimmed);
+  if (!(await NodeFSP.stat(canonical)).isDirectory()) {
     throw new Error("Dora worktree path must be a directory.");
   }
   return canonical;
@@ -357,12 +357,16 @@ export function makeNodeDoraJsonlProcess(input: {
   readonly environment: NodeJS.ProcessEnv;
 }): Promise<DoraJsonlProcess> {
   return new Promise((resolve, reject) => {
-    const child: ChildProcessWithoutNullStreams = spawn(input.binaryPath, [...input.launchArgs], {
-      cwd: input.cwd,
-      env: sanitizeDoraEnvironment(input.environment),
-      shell: false,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    const child: NodeChildProcess.ChildProcessWithoutNullStreams = NodeChildProcess.spawn(
+      input.binaryPath,
+      [...input.launchArgs],
+      {
+        cwd: input.cwd,
+        env: sanitizeDoraEnvironment(input.environment),
+        shell: false,
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
     // stderr is outside the JSONL protocol. Keep it flowing so a noisy child
     // cannot fill its pipe and block stdout/protocol progress; never retain it.
     child.stderr.resume();
@@ -370,7 +374,7 @@ export function makeNodeDoraJsonlProcess(input: {
     child.once("error", onError);
     child.once("spawn", () => {
       child.off("error", onError);
-      const lines = Readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
+      const lines = NodeReadline.createInterface({ input: child.stdout, crlfDelay: Infinity });
       const events = (async function* () {
         for await (const line of lines) {
           if (line.length > MAX_JSONL_LINE_CHARS) throw new Error("Dora JSONL line exceeds limit.");
