@@ -247,6 +247,13 @@ describe("normalizeDispatchCommand Dora activities", () => {
       Effect.gen(function* () {
         const baseCommand = doraActivityCommand({});
         const baseActivity = activityOf(baseCommand);
+        const maliciousPayload = yield* Schema.decodeUnknownEffect(
+          Schema.fromJsonString(Schema.Unknown),
+        )('{"__proto__":"unsafe"}');
+        if (typeof maliciousPayload !== "object" || maliciousPayload === null) {
+          throw new Error("Expected malicious JSON payload to decode to an object.");
+        }
+        expect(Object.hasOwn(maliciousPayload, "__proto__")).toBe(true);
         const invalidCommands: ClientOrchestrationCommand[] = [
           ...["tool.completed", "approval.requested", "user-input.requested", "other.kind"].map(
             (kind) =>
@@ -276,9 +283,7 @@ describe("normalizeDispatchCommand Dora activities", () => {
             four: "x".repeat(4_096),
             five: "x".repeat(4_096),
           }),
-          doraActivityCommand(
-            Schema.decodeUnknownSync(Schema.UnknownFromJsonString)('{"__proto__":"unsafe"}'),
-          ),
+          doraActivityCommand(maliciousPayload),
           doraActivityCommand({ count: Number.NaN }),
         ];
 

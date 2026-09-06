@@ -51,11 +51,11 @@ const PreflightResultJson = Schema.fromJsonString(
   }),
 );
 
-const encodeSourcePackage = Schema.encodeSync(SourcePackageJson);
-const encodePackageMetadata = Schema.encodeSync(PackageMetadataJson);
-const decodePackageIdentity = Schema.decodeUnknownSync(PackageIdentityJson);
-const decodeStageResult = Schema.decodeUnknownSync(StageResultJson);
-const decodePreflightResult = Schema.decodeUnknownSync(PreflightResultJson);
+const encodeSourcePackage = Schema.encodeEffect(SourcePackageJson);
+const encodePackageMetadata = Schema.encodeEffect(PackageMetadataJson);
+const decodePackageIdentity = Schema.decodeUnknownEffect(PackageIdentityJson);
+const decodeStageResult = Schema.decodeUnknownEffect(StageResultJson);
+const decodePreflightResult = Schema.decodeUnknownEffect(PreflightResultJson);
 
 const withTemporaryPackage = <A, E, R>(test: (packageRoot: string) => Effect.Effect<A, E, R>) =>
   Effect.scoped(
@@ -70,24 +70,21 @@ const withTemporaryPackage = <A, E, R>(test: (packageRoot: string) => Effect.Eff
       yield* fileSystem.makeDirectory(packageRoot);
       yield* fileSystem.writeFileString(
         path.join(packageRoot, "package.json"),
-        `${encodeSourcePackage({ name: "source-package" })}\n`,
+        `${yield* encodeSourcePackage({ name: "source-package" })}\n`,
       );
       return yield* test(packageRoot);
     }),
   );
 
 const assertPromiseRejects = (operation: () => Promise<unknown>, expectedMessage: RegExp) =>
-  Effect.tryPromise({
-    try: operation,
-    catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
-  }).pipe(
-    Effect.flip,
-    Effect.tap((cause) =>
-      Effect.sync(() => {
-        assert.instanceOf(cause, Error);
-        if (cause instanceof Error) assert.match(cause.message, expectedMessage);
-      }),
-    ),
+  Effect.tryPromise(operation).pipe(
+    Effect.match({
+      onFailure: (error) => {
+        assert.instanceOf(error.cause, Error);
+        if (error.cause instanceof Error) assert.match(error.cause.message, expectedMessage);
+      },
+      onSuccess: () => assert.fail("Expected promise to reject."),
+    }),
   );
 
 const directoryLink = (target: string, link: string) =>
@@ -141,11 +138,10 @@ const runNode = (args: ReadonlyArray<string>, cwd?: string) =>
 it.layer(NodeServices.layer)("stage-t3-runtime", (it) => {
   it.effect("is importable by plain Node without a TypeScript runtime loader", () =>
     Effect.gen(function* () {
-      const result = yield* runNode([
-        "--input-type=module",
-        "--eval",
-        `import(${Schema.encodeSync(Schema.UnknownFromJsonString)(new URL("./stage-t3-runtime.mjs", import.meta.url).href)})`,
-      ]);
+      const moduleUrl = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.String))(
+        new URL("./stage-t3-runtime.mjs", import.meta.url).href,
+      );
+      const result = yield* runNode(["--input-type=module", "--eval", `import(${moduleUrl})`]);
 
       assert.equal(result.status, 0, result.stderr || result.stdout);
     }),
@@ -189,7 +185,7 @@ it.layer(NodeServices.layer)("stage-t3-runtime", (it) => {
         yield* fileSystem.makeDirectory(dependencyRoot, { recursive: true });
         yield* fileSystem.writeFileString(
           path.join(dependencyRoot, "package.json"),
-          `${encodePackageMetadata({ name: dependencyName, exports: {} })}\n`,
+          `${yield* encodePackageMetadata({ name: dependencyName, exports: {} })}\n`,
         );
 
         assert.equal(
@@ -217,7 +213,7 @@ it.layer(NodeServices.layer)("stage-t3-runtime", (it) => {
           yield* fileSystem.makeDirectory(packageStoreRoot, { recursive: true });
           yield* fileSystem.writeFileString(
             path.join(packageStoreRoot, "package.json"),
-            `${encodePackageMetadata({ name: dependencyName, exports: {} })}\n`,
+            `${yield* encodePackageMetadata({ name: dependencyName, exports: {} })}\n`,
           );
           yield* fileSystem.makeDirectory(path.dirname(dependencyLink), { recursive: true });
           yield* directoryLink(packageStoreRoot, dependencyLink);
@@ -252,7 +248,7 @@ it.layer(NodeServices.layer)("stage-t3-runtime", (it) => {
           yield* fileSystem.makeDirectory(wrongNameRoot, { recursive: true });
           yield* fileSystem.writeFileString(
             path.join(wrongNameRoot, "package.json"),
-            `${encodePackageMetadata({
+            `${yield* encodePackageMetadata({
               name: "@scope/not-the-requested-package",
               exports: {},
             })}\n`,
@@ -305,7 +301,7 @@ it.layer(NodeServices.layer)("stage-t3-runtime", (it) => {
             );
 
             assert.equal(stage.status, 0, stage.stderr || stage.stdout);
-            stagedByInvocationCwd.set(cwd, decodeStageResult(stage.stdout));
+            stagedByInvocationCwd.set(cwd, yield* decodeStageResult(stage.stdout));
           }
           const staged = stagedByInvocationCwd.get(repositoryRoot);
           if (staged === undefined)
@@ -325,7 +321,7 @@ it.layer(NodeServices.layer)("stage-t3-runtime", (it) => {
             yield* fileSystem.exists(path.join(staged.versionRoot, ".staging-preflight.sqlite")),
           );
 
-          const stagedT3Package = decodePackageIdentity(
+          const stagedT3Package = yield* decodePackageIdentity(
             yield* fileSystem.readFileString(
               path.join(staged.versionRoot, "node_modules", "t3", "package.json"),
             ),
@@ -334,7 +330,7 @@ it.layer(NodeServices.layer)("stage-t3-runtime", (it) => {
           assert.equal(stagedT3Package.version, RELEASE_VERSION);
 
           const externalPackageName = "@ff-labs/fff-node";
-          const sourceExternalPackage = decodePackageIdentity(
+          const sourceExternalPackage = yield* decodePackageIdentity(
             yield* fileSystem.readFileString(
               path.join(
                 repositoryRoot,
@@ -347,7 +343,7 @@ it.layer(NodeServices.layer)("stage-t3-runtime", (it) => {
               ),
             ),
           );
-          const stagedExternalPackage = decodePackageIdentity(
+          const stagedExternalPackage = yield* decodePackageIdentity(
             yield* fileSystem.readFileString(
               path.join(staged.versionRoot, "node_modules", "@ff-labs", "fff-node", "package.json"),
             ),
@@ -373,7 +369,7 @@ it.layer(NodeServices.layer)("stage-t3-runtime", (it) => {
             String(SERVICE_LAUNCHER_PROTOCOL),
           ]);
           assert.equal(preflight.status, 0, preflight.stderr || preflight.stdout);
-          const preflightResult = decodePreflightResult(preflight.stdout);
+          const preflightResult = yield* decodePreflightResult(preflight.stdout);
           assert.equal(preflightResult.status, "ready");
           assert.equal(preflightResult.version, RELEASE_VERSION);
           assert.equal(preflightResult.launcherProtocol, SERVICE_LAUNCHER_PROTOCOL);
