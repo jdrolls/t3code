@@ -106,7 +106,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     command: OrchestrationCommand,
     capability: AuthenticatedDoraActivityCapability | undefined,
     receivedAt: string,
-  ): Effect.Effect<OrchestrationCommand, OrchestrationCommandInvariantError> => {
+  ): Effect.Effect<OrchestrationCommand, OrchestrationDispatchError> => {
     if (command.type !== "thread.activity.append" || !command.activity.kind.startsWith("dora.")) {
       return Effect.succeed(command);
     }
@@ -140,31 +140,62 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         }),
       );
     }
-    const thread = commandReadModel.threads.find((candidate) => candidate.id === command.threadId);
-    const session = thread?.session;
-    if (
-      thread?.deletedAt !== null ||
-      session === null ||
-      session?.providerName !== "dora" ||
-      (session.status !== "running" && session.status !== "ready") ||
-      session.providerInstanceId !== capability.providerInstanceId ||
-      session.providerSessionId !== capability.providerSessionId ||
-      capability.threadId !== command.threadId
-    ) {
-      return Effect.fail(
-        new OrchestrationCommandInvariantError({
-          commandType: command.type,
-          detail: "Dora activity does not match an active bound Dora session.",
-        }),
+
+    const hasActiveBoundDoraSession = (readModel: OrchestrationReadModel): boolean => {
+      const thread = readModel.threads.find((candidate) => candidate.id === command.threadId);
+      const session = thread?.session;
+      return (
+        thread !== undefined &&
+        thread.id === command.threadId &&
+        thread.deletedAt === null &&
+        session != null &&
+        session.threadId === command.threadId &&
+        session.providerName === "dora" &&
+        (session.status === "running" || session.status === "ready") &&
+        session.providerInstanceId === capability.providerInstanceId &&
+        session.providerSessionId === capability.providerSessionId &&
+        capability.threadId === command.threadId
       );
-    }
-    // The authenticated control-plane path cannot preserve a caller-controlled
-    // clock in retained activity data. Stamp both command and activity at engine receipt time.
-    return Effect.succeed({
+    };
+    const stampAtReceipt = (): OrchestrationCommand => ({
+      // The authenticated control-plane path cannot preserve a caller-controlled
+      // clock in retained activity data. Stamp both command and activity at engine receipt time.
       ...command,
       createdAt: receivedAt,
       activity: { ...command.activity, createdAt: receivedAt },
     });
+
+    if (hasActiveBoundDoraSession(commandReadModel)) {
+      return Effect.succeed(stampAtReceipt());
+    }
+
+    // Provider ingestion can append activity after the session projection is
+    // durable but before this worker receives the corresponding session event.
+    // Only this otherwise-rejected Dora activity path may refresh the command
+    // model, and a lower-sequence projection can never replace newer state.
+    return projectionSnapshotQuery.getCommandReadModel().pipe(
+      Effect.mapError(
+        (cause) =>
+          new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: "Dora activity does not match an active bound Dora session.",
+            cause,
+          }),
+      ),
+      Effect.flatMap((persistedReadModel) => {
+        if (persistedReadModel.snapshotSequence >= commandReadModel.snapshotSequence) {
+          commandReadModel = persistedReadModel;
+        }
+        return hasActiveBoundDoraSession(commandReadModel)
+          ? Effect.succeed(stampAtReceipt())
+          : Effect.fail(
+              new OrchestrationCommandInvariantError({
+                commandType: command.type,
+                detail: "Dora activity does not match an active bound Dora session.",
+              }),
+            );
+      }),
+    );
   };
 
   const projectEventsOntoReadModel = (

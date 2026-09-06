@@ -14,6 +14,7 @@ import {
   ThreadId,
   TurnId,
   type OrchestrationEvent,
+  type OrchestrationReadModel,
   ProviderInstanceId,
   ProviderSessionId,
 } from "@t3tools/contracts";
@@ -52,7 +53,10 @@ import {
   OrchestrationProjectionPipeline,
   type OrchestrationProjectionPipelineShape,
 } from "../Services/ProjectionPipeline.ts";
-import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
+import {
+  ProjectionSnapshotQuery,
+  type ProjectionSnapshotQueryShape,
+} from "../Services/ProjectionSnapshotQuery.ts";
 import { ServerConfig } from "../../config.ts";
 import { createAuthenticatedDoraActivityCapability } from "../DoraActivityAuthorization.ts";
 
@@ -114,6 +118,148 @@ const hasMetricSnapshot = (
       snapshot.id === id &&
       Object.entries(attributes).every(([key, value]) => snapshot.attributes?.[key] === value),
   );
+
+function makeDoraCommandReadModel(
+  snapshotSequence: number,
+  session: "absent" | "bound",
+): OrchestrationReadModel {
+  const projectId = ProjectId.make("project-dora-reconciliation");
+  const threadId = ThreadId.make("thread-dora-reconciliation");
+  const providerInstanceId = ProviderInstanceId.make("dora");
+  const providerSessionId = ProviderSessionId.make("dora-session-reconciliation");
+  const createdAt = now();
+
+  return {
+    snapshotSequence,
+    updatedAt: createdAt,
+    projects: [
+      {
+        id: projectId,
+        title: "Dora reconciliation",
+        workspaceRoot: "/tmp/dora-reconciliation",
+        defaultModelSelection: null,
+        scripts: [],
+        createdAt,
+        updatedAt: createdAt,
+        deletedAt: null,
+      },
+    ],
+    threads: [
+      {
+        id: threadId,
+        projectId,
+        title: "Dora reconciliation",
+        modelSelection: { instanceId: providerInstanceId, model: "dora" },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "full-access",
+        branch: null,
+        worktreePath: null,
+        latestTurn: null,
+        createdAt,
+        updatedAt: createdAt,
+        archivedAt: null,
+        settledOverride: null,
+        settledAt: null,
+        deletedAt: null,
+        messages: [],
+        proposedPlans: [],
+        activities: [],
+        checkpoints: [],
+        session:
+          session === "bound"
+            ? {
+                threadId,
+                status: "running",
+                providerName: "dora",
+                providerInstanceId,
+                providerSessionId,
+                runtimeMode: "full-access",
+                activeTurnId: TurnId.make("turn-dora-reconciliation"),
+                lastError: null,
+                updatedAt: createdAt,
+              }
+            : null,
+      },
+    ],
+  };
+}
+
+function makeDoraReconciliationRuntime(
+  commandReadModels: ReadonlyArray<OrchestrationReadModel>,
+  options?: { readonly reconciliationReadError?: PersistenceSqlError },
+) {
+  let commandReadModelReads = 0;
+  let appendCount = 0;
+  let nextSequence = (commandReadModels.at(-1)?.snapshotSequence ?? 0) + 1;
+  const commandReadModel = () =>
+    Effect.suspend(() => {
+      const readIndex = commandReadModelReads;
+      commandReadModelReads += 1;
+      if (readIndex > 0 && options?.reconciliationReadError !== undefined) {
+        return Effect.fail(options.reconciliationReadError);
+      }
+      const readModel = commandReadModels.at(
+        Math.min(readIndex, commandReadModels.length - 1),
+      );
+      return readModel === undefined
+        ? Effect.die("A command read model is required for this test.")
+        : Effect.succeed(readModel);
+    });
+  const snapshotQuery: ProjectionSnapshotQueryShape = {
+    getCommandReadModel: commandReadModel,
+    getUserInputActivity: () => Effect.die("unused"),
+    getSnapshot: () => Effect.die("unused"),
+    getShellSnapshot: () => Effect.die("unused"),
+    getArchivedShellSnapshot: () => Effect.die("unused"),
+    searchThreads: () => Effect.die("unused"),
+    getSnapshotSequence: () => Effect.die("unused"),
+    getCounts: () => Effect.die("unused"),
+    getEventReplayStats: () => Effect.die("unused"),
+    getActiveProjectByWorkspaceRoot: () => Effect.die("unused"),
+    getProjectShellById: () => Effect.die("unused"),
+    getFirstActiveThreadIdByProjectId: () => Effect.die("unused"),
+    getThreadCheckpointContext: () => Effect.die("unused"),
+    getFullThreadDiffContext: () => Effect.die("unused"),
+    getThreadShellById: () => Effect.die("unused"),
+    getThreadDetailById: () => Effect.die("unused"),
+    getThreadDetailSnapshot: () => Effect.die("unused"),
+  };
+  const eventStore: OrchestrationEventStoreShape = {
+    append: (event) =>
+      Effect.sync(() => {
+        appendCount += 1;
+        const savedEvent = { ...event, sequence: nextSequence } as OrchestrationEvent;
+        nextSequence += 1;
+        return savedEvent;
+      }),
+    readFromSequence: () => Stream.empty,
+    readAll: () => Stream.empty,
+    hasEventAfter: () => Effect.succeed(false),
+  };
+  const runtime = ManagedRuntime.make(
+    OrchestrationEngineLive.pipe(
+      Layer.provide(Layer.succeed(ProjectionSnapshotQuery, snapshotQuery)),
+      Layer.provide(
+        Layer.succeed(OrchestrationProjectionPipeline, {
+          bootstrap: Effect.void,
+          projectEvent: () => Effect.void,
+          projectEventDeferred: () => Effect.succeed(Effect.void),
+        } satisfies OrchestrationProjectionPipelineShape),
+      ),
+      Layer.provide(Layer.succeed(OrchestrationEventStore, eventStore)),
+      Layer.provide(ThreadBackgroundLiveness.layer),
+      Layer.provide(OrchestrationCommandReceiptRepositoryLive),
+      Layer.provide(SqlitePersistenceMemory),
+      Layer.provideMerge(NodeServices.layer),
+    ),
+  );
+
+  return {
+    runtime,
+    commandReadModelReads: () => commandReadModelReads,
+    appendCount: () => appendCount,
+  };
+}
 
 describe("OrchestrationEngine", () => {
   it.each(["running", "stopped"] as const)(
@@ -458,6 +604,147 @@ describe("OrchestrationEngine", () => {
     expect(fullSnapshotReadCount).toBe(0);
 
     await runtime.dispose();
+  });
+
+  it("reconciles non-stale Dora session bindings and rejects reconciliation failures", async () => {
+    const threadId = ThreadId.make("thread-dora-reconciliation");
+    const providerInstanceId = ProviderInstanceId.make("dora");
+    const providerSessionId = ProviderSessionId.make("dora-session-reconciliation");
+    const capability = createAuthenticatedDoraActivityCapability({
+      threadId,
+      providerInstanceId,
+      providerSessionId,
+    });
+    const activity = (commandId: CommandId) => ({
+      type: "thread.activity.append" as const,
+      commandId,
+      threadId,
+      providerInstanceId,
+      providerSessionId,
+      activity: {
+        id: EventId.make(`activity-${commandId}`),
+        tone: "info" as const,
+        kind: "dora.plan" as const,
+        summary: "Plan completed",
+        payload: {},
+        turnId: null,
+        createdAt: now(),
+      },
+      createdAt: now(),
+    });
+
+    const reconciled = makeDoraReconciliationRuntime([
+      makeDoraCommandReadModel(7, "absent"),
+      makeDoraCommandReadModel(8, "bound"),
+    ]);
+    try {
+      const engine = await reconciled.runtime.runPromise(
+        Effect.service(OrchestrationEngineService),
+      );
+      const accepted = await reconciled.runtime.runPromise(
+        engine.dispatch(activity(CommandId.make("cmd-dora-reconciliation-accepted")), {
+          doraActivityCapability: capability,
+        }),
+      );
+      expect(accepted.sequence).toBe(9);
+      expect(await reconciled.runtime.runPromise(engine.latestSequence)).toBe(9);
+      expect(reconciled.commandReadModelReads()).toBe(2);
+      expect(reconciled.appendCount()).toBe(1);
+    } finally {
+      await reconciled.runtime.dispose();
+    }
+
+    const equalSequence = makeDoraReconciliationRuntime([
+      makeDoraCommandReadModel(7, "absent"),
+      makeDoraCommandReadModel(7, "bound"),
+    ]);
+    try {
+      const engine = await equalSequence.runtime.runPromise(
+        Effect.service(OrchestrationEngineService),
+      );
+      const accepted = await equalSequence.runtime.runPromise(
+        engine.dispatch(activity(CommandId.make("cmd-dora-reconciliation-equal")), {
+          doraActivityCapability: capability,
+        }),
+      );
+      expect(accepted.sequence).toBe(8);
+      expect(await equalSequence.runtime.runPromise(engine.latestSequence)).toBe(8);
+      expect(equalSequence.commandReadModelReads()).toBe(2);
+      expect(equalSequence.appendCount()).toBe(1);
+    } finally {
+      await equalSequence.runtime.dispose();
+    }
+
+    const stale = makeDoraReconciliationRuntime([
+      makeDoraCommandReadModel(7, "absent"),
+      makeDoraCommandReadModel(6, "bound"),
+    ]);
+    try {
+      const engine = await stale.runtime.runPromise(Effect.service(OrchestrationEngineService));
+      const commandId = CommandId.make("cmd-dora-reconciliation-stale");
+      await expect(
+        stale.runtime.runPromise(
+          engine.dispatch(activity(commandId), { doraActivityCapability: capability }),
+        ),
+      ).rejects.toThrow("Dora activity does not match an active bound Dora session.");
+      const receipts = await stale.runtime.runPromise(
+        Effect.service(OrchestrationCommandReceipts.OrchestrationCommandReceiptRepository),
+      );
+      expect(
+        Option.getOrNull(await stale.runtime.runPromise(receipts.getByCommandId({ commandId }))),
+      ).toMatchObject({
+        commandId,
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        status: "rejected",
+        resultSequence: 7,
+      });
+      expect(await stale.runtime.runPromise(engine.latestSequence)).toBe(7);
+      expect(stale.commandReadModelReads()).toBe(2);
+      expect(stale.appendCount()).toBe(0);
+    } finally {
+      await stale.runtime.dispose();
+    }
+
+    const readFailure = makeDoraReconciliationRuntime(
+      [makeDoraCommandReadModel(7, "absent")],
+      {
+        reconciliationReadError: new PersistenceSqlError({
+          operation: "test.dora-reconciliation-read",
+          detail: "projection unavailable",
+        }),
+      },
+    );
+    try {
+      const engine = await readFailure.runtime.runPromise(
+        Effect.service(OrchestrationEngineService),
+      );
+      const commandId = CommandId.make("cmd-dora-reconciliation-read-failure");
+      await expect(
+        readFailure.runtime.runPromise(
+          engine.dispatch(activity(commandId), { doraActivityCapability: capability }),
+        ),
+      ).rejects.toThrow("Dora activity does not match an active bound Dora session.");
+      const receipts = await readFailure.runtime.runPromise(
+        Effect.service(OrchestrationCommandReceipts.OrchestrationCommandReceiptRepository),
+      );
+      expect(
+        Option.getOrNull(await readFailure.runtime.runPromise(receipts.getByCommandId({ commandId }))),
+      ).toMatchObject({
+        commandId,
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        status: "rejected",
+        error:
+          "Orchestration command invariant failed (thread.activity.append): Dora activity does not match an active bound Dora session.",
+        resultSequence: 7,
+      });
+      expect(await readFailure.runtime.runPromise(engine.latestSequence)).toBe(7);
+      expect(readFailure.commandReadModelReads()).toBe(2);
+      expect(readFailure.appendCount()).toBe(0);
+    } finally {
+      await readFailure.runtime.dispose();
+    }
   });
 
   effectIt.effect("preserves the blocked-settle error and persists its rejected receipt", () =>
