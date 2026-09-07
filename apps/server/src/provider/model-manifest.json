@@ -1,8 +1,9 @@
 {
   "version": 1,
-  "updatedAt": "2026-09-03T09:58:00Z",
+  "updatedAt": "2026-09-06T12:30:00Z",
   "currentModels": {
     "codex": [
+      "gpt-6-astra",
       "gpt-5.6-luna",
       "gpt-5.6-terra",
       "gpt-5.6-sol",
@@ -553,6 +554,19 @@
         }
       },
       "models": [
+        {
+          "slug": "gpt-6-astra",
+          "name": "GPT-6 Astra",
+          "aliases": ["astra"],
+          "status": "current",
+          "badge": "new",
+          "profile": "fable-5",
+          "adapter": {
+            "claudeCode": {
+              "minVersion": "2.1.257"
+            }
+          }
+        },
         {
           "slug": "claude-fable-5-1",
           "name": "Claude Fable 5.1",
