@@ -294,6 +294,16 @@ const makeOrchestrationEngine = Effect.gen(function* () {
               : undefined;
         if (
           guardedSettlement !== undefined &&
+          guardedSettlement.expectedSnapshotSequence > commandReadModel.snapshotSequence
+        ) {
+          return yield* new OrchestrationCommandInvariantError({
+            commandType: envelope.command.type,
+            detail: `thread ${guardedSettlement.threadId} settlement snapshot is ahead of the authoritative sequence`,
+          });
+        }
+
+        if (
+          guardedSettlement !== undefined &&
           (yield* eventStore.hasEventAfter({
             aggregateKind: "thread",
             aggregateId: guardedSettlement.threadId,

@@ -955,141 +955,160 @@ describe("OrchestrationEngine", () => {
       }).pipe(Effect.provide(makeOrchestrationLayer())),
   );
 
-  effectIt.effect(
-    "guards client settlement against changed threads and live background work",
-    () =>
-      Effect.gen(function* () {
-        const engine = yield* OrchestrationEngineService;
-        const backgroundLiveness = yield* ThreadBackgroundLiveness.ThreadBackgroundLivenessService;
-        const projectId = ProjectId.make("project-client-settle-guard");
-        const unchangedThreadId = ThreadId.make("thread-client-settle-unchanged");
-        const changedThreadId = ThreadId.make("thread-client-settle-changed");
-        const unrelatedThreadId = ThreadId.make("thread-client-settle-unrelated");
-        const liveThreadId = ThreadId.make("thread-client-settle-live");
-        const otherThreadId = ThreadId.make("thread-client-settle-other");
-        const createdAt = now();
+  effectIt.effect("guards client settlement against changed threads and live background work", () =>
+    Effect.gen(function* () {
+      const engine = yield* OrchestrationEngineService;
+      const snapshots = yield* ProjectionSnapshotQuery;
+      const backgroundLiveness = yield* ThreadBackgroundLiveness.ThreadBackgroundLivenessService;
+      const projectId = ProjectId.make("project-client-settle-guard");
+      const unchangedThreadId = ThreadId.make("thread-client-settle-unchanged");
+      const changedThreadId = ThreadId.make("thread-client-settle-changed");
+      const unrelatedThreadId = ThreadId.make("thread-client-settle-unrelated");
+      const liveThreadId = ThreadId.make("thread-client-settle-live");
+      const otherThreadId = ThreadId.make("thread-client-settle-other");
+      const createdAt = now();
 
+      yield* engine.dispatch({
+        type: "project.create",
+        commandId: CommandId.make("cmd-client-settle-project"),
+        projectId,
+        title: "Project",
+        workspaceRoot: "/tmp/client-settle-guard",
+        createdAt,
+      });
+      for (const threadId of [
+        unchangedThreadId,
+        changedThreadId,
+        unrelatedThreadId,
+        liveThreadId,
+        otherThreadId,
+      ]) {
         yield* engine.dispatch({
-          type: "project.create",
-          commandId: CommandId.make("cmd-client-settle-project"),
+          type: "thread.create",
+          commandId: CommandId.make(`cmd-create-${threadId}`),
+          threadId,
           projectId,
-          title: "Project",
-          workspaceRoot: "/tmp/client-settle-guard",
-          createdAt,
-        });
-        for (const threadId of [
-          unchangedThreadId,
-          changedThreadId,
-          unrelatedThreadId,
-          liveThreadId,
-          otherThreadId,
-        ]) {
-          yield* engine.dispatch({
-            type: "thread.create",
-            commandId: CommandId.make(`cmd-create-${threadId}`),
-            threadId,
-            projectId,
-            title: "Thread",
-            modelSelection: {
-              instanceId: ProviderInstanceId.make("codex"),
-              model: "gpt-5-codex",
-            },
-            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-            runtimeMode: "full-access",
-            branch: null,
-            worktreePath: null,
-            createdAt,
-          });
-        }
-
-        const unchangedSnapshotSequence = yield* engine.latestSequence;
-        const guardedSettle = {
-          type: "thread.settle" as const,
-          commandId: CommandId.make("cmd-client-settle-unchanged"),
-          threadId: unchangedThreadId,
-          expectedSnapshotSequence: unchangedSnapshotSequence,
-        };
-        const firstGuardedSettle = yield* engine.dispatch(guardedSettle);
-        yield* engine.dispatch({
-          type: "thread.unsettle",
-          commandId: CommandId.make("cmd-client-settle-unchanged-unsettle"),
-          threadId: unchangedThreadId,
-          reason: "user",
-        });
-        const replayedGuardedSettle = yield* engine.dispatch(guardedSettle);
-        expect(replayedGuardedSettle.sequence).toBe(firstGuardedSettle.sequence);
-        const staleReplayReplacement = yield* engine
-          .dispatch({
-            ...guardedSettle,
-            commandId: CommandId.make("cmd-client-settle-unchanged-stale-replacement"),
-          })
-          .pipe(Effect.flip);
-        expect(staleReplayReplacement._tag).toBe("OrchestrationCommandInvariantError");
-
-        const changedSnapshotSequence = yield* engine.latestSequence;
-        yield* engine.dispatch({
-          type: "thread.session.set",
-          commandId: CommandId.make("cmd-client-settle-changed-ready"),
-          threadId: changedThreadId,
-          createdAt,
-          session: {
-            threadId: changedThreadId,
-            status: "ready",
-            providerName: "codex",
-            runtimeMode: "full-access",
-            activeTurnId: null,
-            lastError: null,
-            updatedAt: createdAt,
+          title: "Thread",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("codex"),
+            model: "gpt-5-codex",
           },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "full-access",
+          branch: null,
+          worktreePath: null,
+          createdAt,
         });
-        const changedThreadError = yield* engine
-          .dispatch({
-            type: "thread.settle",
-            commandId: CommandId.make("cmd-client-settle-changed-stale"),
-            threadId: changedThreadId,
-            expectedSnapshotSequence: changedSnapshotSequence,
-          })
-          .pipe(Effect.flip);
-        expect(changedThreadError._tag).toBe("OrchestrationCommandInvariantError");
-        yield* engine.dispatch({
+      }
+
+      const beforeFutureSettlement = yield* snapshots.getSnapshot();
+      const futureSettlementError = yield* engine
+        .dispatch({
           type: "thread.settle",
-          commandId: CommandId.make("cmd-client-settle-changed-attended"),
+          commandId: CommandId.make("cmd-client-settle-future-snapshot"),
+          threadId: unchangedThreadId,
+          expectedSnapshotSequence: beforeFutureSettlement.snapshotSequence + 1,
+        })
+        .pipe(Effect.flip);
+      expect(futureSettlementError._tag).toBe("OrchestrationCommandInvariantError");
+      expect(yield* engine.latestSequence).toBe(beforeFutureSettlement.snapshotSequence);
+      const afterFutureSettlement = yield* snapshots.getSnapshot();
+      expect(afterFutureSettlement.snapshotSequence).toBe(beforeFutureSettlement.snapshotSequence);
+      expect(
+        afterFutureSettlement.threads.find((thread) => thread.id === unchangedThreadId),
+      ).toMatchObject({
+        settledOverride: null,
+        settledAt: null,
+      });
+
+      const unchangedSnapshotSequence = yield* engine.latestSequence;
+      const guardedSettle = {
+        type: "thread.settle" as const,
+        commandId: CommandId.make("cmd-client-settle-unchanged"),
+        threadId: unchangedThreadId,
+        expectedSnapshotSequence: unchangedSnapshotSequence,
+      };
+      const firstGuardedSettle = yield* engine.dispatch(guardedSettle);
+      yield* engine.dispatch({
+        type: "thread.unsettle",
+        commandId: CommandId.make("cmd-client-settle-unchanged-unsettle"),
+        threadId: unchangedThreadId,
+        reason: "user",
+      });
+      const replayedGuardedSettle = yield* engine.dispatch(guardedSettle);
+      expect(replayedGuardedSettle.sequence).toBe(firstGuardedSettle.sequence);
+      const staleReplayReplacement = yield* engine
+        .dispatch({
+          ...guardedSettle,
+          commandId: CommandId.make("cmd-client-settle-unchanged-stale-replacement"),
+        })
+        .pipe(Effect.flip);
+      expect(staleReplayReplacement._tag).toBe("OrchestrationCommandInvariantError");
+
+      const changedSnapshotSequence = yield* engine.latestSequence;
+      yield* engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-client-settle-changed-ready"),
+        threadId: changedThreadId,
+        createdAt,
+        session: {
           threadId: changedThreadId,
-        });
-
-        const unrelatedSnapshotSequence = yield* engine.latestSequence;
-        yield* engine.dispatch({
-          type: "thread.meta.update",
-          commandId: CommandId.make("cmd-client-settle-unrelated-change"),
-          threadId: otherThreadId,
-          title: "Changed elsewhere",
-        });
-        yield* engine.dispatch({
+          status: "ready",
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: createdAt,
+        },
+      });
+      const changedThreadError = yield* engine
+        .dispatch({
           type: "thread.settle",
-          commandId: CommandId.make("cmd-client-settle-unrelated-guarded"),
-          threadId: unrelatedThreadId,
-          expectedSnapshotSequence: unrelatedSnapshotSequence,
-        });
+          commandId: CommandId.make("cmd-client-settle-changed-stale"),
+          threadId: changedThreadId,
+          expectedSnapshotSequence: changedSnapshotSequence,
+        })
+        .pipe(Effect.flip);
+      expect(changedThreadError._tag).toBe("OrchestrationCommandInvariantError");
+      yield* engine.dispatch({
+        type: "thread.settle",
+        commandId: CommandId.make("cmd-client-settle-changed-attended"),
+        threadId: changedThreadId,
+      });
 
-        const liveSnapshotSequence = yield* engine.latestSequence;
-        backgroundLiveness.recordTaskLiveness({
+      const unrelatedSnapshotSequence = yield* engine.latestSequence;
+      yield* engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-client-settle-unrelated-change"),
+        threadId: otherThreadId,
+        title: "Changed elsewhere",
+      });
+      yield* engine.dispatch({
+        type: "thread.settle",
+        commandId: CommandId.make("cmd-client-settle-unrelated-guarded"),
+        threadId: unrelatedThreadId,
+        expectedSnapshotSequence: unrelatedSnapshotSequence,
+      });
+
+      const liveSnapshotSequence = yield* engine.latestSequence;
+      backgroundLiveness.recordTaskLiveness({
+        threadId: liveThreadId,
+        taskId: "client-settle-live-task",
+        taskType: "subagent",
+        status: undefined,
+        kind: "started",
+      });
+      const liveThreadError = yield* engine
+        .dispatch({
+          type: "thread.settle",
+          commandId: CommandId.make("cmd-client-settle-live"),
           threadId: liveThreadId,
-          taskId: "client-settle-live-task",
-          taskType: "subagent",
-          status: undefined,
-          kind: "started",
-        });
-        const liveThreadError = yield* engine
-          .dispatch({
-            type: "thread.settle",
-            commandId: CommandId.make("cmd-client-settle-live"),
-            threadId: liveThreadId,
-            expectedSnapshotSequence: liveSnapshotSequence,
-          })
-          .pipe(Effect.flip);
-        expect(liveThreadError._tag).toBe("OrchestrationCommandInvariantError");
-        backgroundLiveness.clearThreadLiveness(liveThreadId);
-      }).pipe(Effect.provide(makeOrchestrationLayer())),
+          expectedSnapshotSequence: liveSnapshotSequence,
+        })
+        .pipe(Effect.flip);
+      expect(liveThreadError._tag).toBe("OrchestrationCommandInvariantError");
+      backgroundLiveness.clearThreadLiveness(liveThreadId);
+    }).pipe(Effect.provide(makeOrchestrationLayer())),
   );
 
   it("persists deterministic read models for repeated snapshot reads", async () => {
