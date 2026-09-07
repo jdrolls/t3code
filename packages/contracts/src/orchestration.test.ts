@@ -561,6 +561,7 @@ it.effect("decodes thread settle and unsettle commands", () =>
       type: "thread.settle",
       commandId: "cmd-settle-1",
       threadId: "thread-1",
+      expectedSnapshotSequence: 3,
     });
     const unsettle = yield* decodeOrchestrationCommand({
       type: "thread.unsettle",
@@ -571,6 +572,19 @@ it.effect("decodes thread settle and unsettle commands", () =>
 
     assert.strictEqual(settle.type, "thread.settle");
     assert.strictEqual(unsettle.type, "thread.unsettle");
+    if (settle.type === "thread.settle") {
+      assert.strictEqual(settle.expectedSnapshotSequence, 3);
+    }
+
+    for (const expectedSnapshotSequence of [-1, 1.5]) {
+      const invalid = yield* decodeOrchestrationCommand({
+        type: "thread.settle",
+        commandId: "cmd-settle-invalid-sequence",
+        threadId: "thread-1",
+        expectedSnapshotSequence,
+      }).pipe(Effect.flip);
+      assert.ok(invalid);
+    }
 
     // "activity" is server-owned: it exists on the event, never on the
     // command, so a client cannot forge the neutral reset.

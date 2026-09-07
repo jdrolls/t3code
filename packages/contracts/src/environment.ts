@@ -94,6 +94,7 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   threadSettlement: Schema.optionalKey(Schema.Boolean),
   /** Server evaluates merge and inactivity settlement without a client. */
   threadAutoSettlement: Schema.optionalKey(Schema.Boolean),
+  threadSettlementPrecondition: Schema.optionalKey(Schema.Boolean),
   /** Server understands thread.snooze / thread.unsnooze commands. Same
       version-skew contract as threadSettlement. */
   threadSnooze: Schema.optionalKey(Schema.Boolean),

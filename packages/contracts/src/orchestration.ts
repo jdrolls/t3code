@@ -876,6 +876,7 @@ const ThreadSettleCommand = Schema.Struct({
   type: Schema.Literal("thread.settle"),
   commandId: CommandId,
   threadId: ThreadId,
+  expectedSnapshotSequence: Schema.optionalKey(NonNegativeInt),
 });
 
 const ThreadAutoSettleCommand = Schema.Struct({
