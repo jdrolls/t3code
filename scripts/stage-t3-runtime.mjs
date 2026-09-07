@@ -17,7 +17,7 @@ import {
 } from "./lib/cli-external-packages.mjs";
 import { SERVICE_LAUNCHER_PROTOCOL } from "./lib/service-launcher-protocol.mjs";
 
-export const RELEASE_VERSION = "0.0.40-fork.6";
+export const RELEASE_VERSION = "0.0.40-fork.7";
 export const FORK_REPOSITORY_URL = "https://github.com/jdrolls/t3code";
 const RELEASE_ENTRY_PATH = NodePath.join("node_modules", "t3", "dist", "bin.mjs");
 const SENTINEL_FILE = ".install-complete";

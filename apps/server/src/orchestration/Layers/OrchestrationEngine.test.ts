@@ -20,7 +20,9 @@ import {
 } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it as effectIt } from "@effect/vitest";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as Metric from "effect/Metric";
@@ -1107,6 +1109,563 @@ describe("OrchestrationEngine", () => {
         })
         .pipe(Effect.flip);
       expect(liveThreadError._tag).toBe("OrchestrationCommandInvariantError");
+      backgroundLiveness.clearThreadLiveness(liveThreadId);
+    }).pipe(Effect.provide(makeOrchestrationLayer())),
+  );
+
+  effectIt.effect("guards continuation starts against stale and nonterminal thread state", () =>
+    Effect.gen(function* () {
+      const createdAt = now();
+      const queuedAt = "2026-01-01T00:00:01.000Z";
+      yield* TestClock.setTime(Date.parse(createdAt));
+      const engine = yield* OrchestrationEngineService;
+      const snapshots = yield* ProjectionSnapshotQuery;
+      const backgroundLiveness = yield* ThreadBackgroundLiveness.ThreadBackgroundLivenessService;
+      const projectId = ProjectId.make("project-turn-start-precondition");
+      const providerInstanceId = ProviderInstanceId.make("codex");
+
+      const createThread = (threadId: ThreadId) =>
+        engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`cmd-create-${threadId}`),
+          threadId,
+          projectId,
+          title: "Thread",
+          modelSelection: { instanceId: providerInstanceId, model: "gpt-5-codex" },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "full-access",
+          branch: null,
+          worktreePath: null,
+          createdAt,
+        });
+      const prepareReadyThread = (threadId: ThreadId) =>
+        Effect.gen(function* () {
+          yield* createThread(threadId);
+          yield* engine.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make(`cmd-ready-${threadId}`),
+            threadId,
+            createdAt,
+            session: {
+              threadId,
+              status: "ready",
+              providerName: "codex",
+              runtimeMode: "full-access",
+              activeTurnId: null,
+              lastError: null,
+              updatedAt: createdAt,
+            },
+          });
+          yield* engine.dispatch({
+            type: "thread.turn.diff.complete",
+            commandId: CommandId.make(`cmd-complete-${threadId}`),
+            threadId,
+            turnId: TurnId.make(`turn-${threadId}`),
+            completedAt: createdAt,
+            checkpointRef: CheckpointRef.make(`refs/t3/checkpoints/${threadId}`),
+            status: "ready",
+            files: [],
+            checkpointTurnCount: 1,
+            createdAt,
+          });
+        });
+      const guardedStart = (
+        threadId: ThreadId,
+        commandId: string,
+        expectedSnapshotSequence: number,
+        commandCreatedAt = createdAt,
+      ) => ({
+        type: "thread.turn.start" as const,
+        commandId: CommandId.make(commandId),
+        threadId,
+        message: {
+          messageId: MessageId.make(`message-${commandId}`),
+          role: "user" as const,
+          text: "continue",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "full-access" as const,
+        expectedSnapshotSequence,
+        createdAt: commandCreatedAt,
+      });
+      const rejectWithoutAppend = (command: ReturnType<typeof guardedStart>) =>
+        Effect.gen(function* () {
+          const sequence = yield* engine.latestSequence;
+          const result = yield* Effect.exit(engine.dispatch(command));
+          if (Exit.isSuccess(result)) {
+            const events = yield* Stream.runCollect(engine.readEvents(0));
+            const matchingEvents = Array.from(events).filter(
+              (event) => event.commandId === command.commandId,
+            );
+            const receiptKind = matchingEvents.length === 0 ? "replayed receipt" : "new append";
+            throw new Error(
+              `Guarded turn start '${command.commandId}' unexpectedly returned ${receiptKind} through sequence ${result.value.sequence}.`,
+            );
+          }
+          const error = Cause.squash(result.cause);
+          expect(error).toMatchObject({
+            _tag: "OrchestrationCommandInvariantError",
+            commandType: command.type,
+          });
+          expect(yield* engine.latestSequence).toBe(sequence);
+        });
+
+      yield* engine.dispatch({
+        type: "project.create",
+        commandId: CommandId.make("cmd-turn-start-precondition-project"),
+        projectId,
+        title: "Project",
+        workspaceRoot: "/tmp/turn-start-precondition",
+        createdAt,
+      });
+
+      const readyThreadId = ThreadId.make("thread-turn-start-ready");
+      yield* prepareReadyThread(readyThreadId);
+      const readySequence = yield* engine.latestSequence;
+      const accepted = guardedStart(readyThreadId, "cmd-turn-start-ready", readySequence);
+      const acceptedResult = yield* engine.dispatch(accepted);
+      const replayedResult = yield* engine.dispatch(accepted);
+      expect(replayedResult.sequence).toBe(acceptedResult.sequence);
+      const acceptedEvents = yield* Stream.runCollect(engine.readEvents(0));
+      expect(
+        Array.from(acceptedEvents).filter((event) => event.commandId === accepted.commandId),
+      ).toHaveLength(2);
+      const acceptedTurnId = TurnId.make("turn-turn-start-accepted");
+      yield* engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-turn-start-accepted-running"),
+        threadId: readyThreadId,
+        createdAt,
+        session: {
+          threadId: readyThreadId,
+          status: "running",
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: acceptedTurnId,
+          lastError: null,
+          updatedAt: createdAt,
+        },
+      });
+      const runningDetail = yield* snapshots.getThreadDetailSnapshot(readyThreadId);
+      expect(Option.getOrThrow(runningDetail).thread.latestTurn).toMatchObject({
+        turnId: acceptedTurnId,
+        state: "running",
+        requestMessageId: accepted.message.messageId,
+      });
+      yield* engine.dispatch({
+        type: "thread.message.assistant.complete",
+        commandId: CommandId.make("cmd-turn-start-accepted-assistant-complete"),
+        threadId: readyThreadId,
+        messageId: MessageId.make("message-turn-start-accepted-assistant"),
+        turnId: acceptedTurnId,
+        createdAt,
+      });
+      yield* engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-turn-start-accepted-ready"),
+        threadId: readyThreadId,
+        createdAt,
+        session: {
+          threadId: readyThreadId,
+          status: "ready",
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: createdAt,
+        },
+      });
+      const completedDetail = yield* snapshots.getThreadDetailSnapshot(readyThreadId);
+      expect(Option.getOrThrow(completedDetail).thread.latestTurn).toMatchObject({
+        turnId: acceptedTurnId,
+        state: "completed",
+        requestMessageId: accepted.message.messageId,
+      });
+
+      const concurrentThreadId = ThreadId.make("thread-turn-start-concurrent");
+      yield* prepareReadyThread(concurrentThreadId);
+      const concurrentSequence = yield* engine.latestSequence;
+      const concurrentStarts = [
+        guardedStart(concurrentThreadId, "cmd-turn-start-concurrent-first", concurrentSequence),
+        guardedStart(concurrentThreadId, "cmd-turn-start-concurrent-second", concurrentSequence),
+      ];
+      const concurrentResults = yield* Effect.all(
+        concurrentStarts.map((command) => Effect.exit(engine.dispatch(command))),
+        { concurrency: "unbounded" },
+      );
+      expect(concurrentResults.filter(Exit.isSuccess)).toHaveLength(1);
+      expect(concurrentResults.filter(Exit.isFailure)).toHaveLength(1);
+      const concurrentEvents = yield* Stream.runCollect(engine.readEvents(0));
+      const concurrentCommandIds = new Set(concurrentStarts.map((command) => command.commandId));
+      expect(
+        Array.from(concurrentEvents).filter(
+          (event) =>
+            event.type === "thread.turn-start-requested" &&
+            event.commandId !== null &&
+            concurrentCommandIds.has(event.commandId),
+        ),
+      ).toHaveLength(1);
+      const concurrentDetail = Option.getOrThrow(
+        yield* snapshots.getThreadDetailSnapshot(concurrentThreadId),
+      );
+      expect(
+        concurrentDetail.thread.messages.filter(
+          (message) =>
+            message.role === "user" &&
+            concurrentStarts.some((command) => command.message.messageId === message.id),
+        ),
+      ).toHaveLength(1);
+
+      const stoppedThreadId = ThreadId.make("thread-turn-start-stopped");
+      yield* createThread(stoppedThreadId);
+      yield* engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-turn-start-stopped-running"),
+        threadId: stoppedThreadId,
+        createdAt,
+        session: {
+          threadId: stoppedThreadId,
+          status: "running",
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: TurnId.make("turn-turn-start-stopped"),
+          lastError: null,
+          updatedAt: createdAt,
+        },
+      });
+      yield* engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-turn-start-stopped-terminal"),
+        threadId: stoppedThreadId,
+        createdAt,
+        session: {
+          threadId: stoppedThreadId,
+          status: "stopped",
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: createdAt,
+        },
+      });
+      yield* engine.dispatch(
+        guardedStart(stoppedThreadId, "cmd-turn-start-stopped", yield* engine.latestSequence),
+      );
+
+      const failedThreadId = ThreadId.make("thread-turn-start-failed");
+      yield* createThread(failedThreadId);
+      yield* engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-turn-start-failed-running"),
+        threadId: failedThreadId,
+        createdAt,
+        session: {
+          threadId: failedThreadId,
+          status: "running",
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: TurnId.make("turn-turn-start-failed"),
+          lastError: null,
+          updatedAt: createdAt,
+        },
+      });
+      yield* engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-turn-start-failed-terminal"),
+        threadId: failedThreadId,
+        createdAt,
+        session: {
+          threadId: failedThreadId,
+          status: "error",
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: "failed",
+          updatedAt: createdAt,
+        },
+      });
+      yield* engine.dispatch(
+        guardedStart(failedThreadId, "cmd-turn-start-failed", yield* engine.latestSequence),
+      );
+
+      const unrelatedThreadId = ThreadId.make("thread-turn-start-unrelated");
+      const unrelatedChangeThreadId = ThreadId.make("thread-turn-start-unrelated-change");
+      yield* prepareReadyThread(unrelatedThreadId);
+      yield* createThread(unrelatedChangeThreadId);
+      const unrelatedSequence = yield* engine.latestSequence;
+      yield* engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-turn-start-unrelated-change"),
+        threadId: unrelatedChangeThreadId,
+        title: "Changed elsewhere",
+      });
+      yield* engine.dispatch(
+        guardedStart(unrelatedThreadId, "cmd-turn-start-unrelated", unrelatedSequence),
+      );
+
+      const staleThreadId = ThreadId.make("thread-turn-start-stale");
+      yield* prepareReadyThread(staleThreadId);
+      const staleSequence = yield* engine.latestSequence;
+      yield* engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-stale-work"),
+        threadId: staleThreadId,
+        message: {
+          messageId: MessageId.make("message-turn-start-stale-work"),
+          role: "user",
+          text: "new work",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "full-access",
+        createdAt,
+      });
+      yield* rejectWithoutAppend(
+        guardedStart(staleThreadId, "cmd-turn-start-stale", staleSequence),
+      );
+
+      const futureThreadId = ThreadId.make("thread-turn-start-future");
+      yield* prepareReadyThread(futureThreadId);
+      const futureSequence = yield* engine.latestSequence;
+      yield* rejectWithoutAppend(
+        guardedStart(futureThreadId, "cmd-turn-start-future", futureSequence + 1),
+      );
+      yield* rejectWithoutAppend(
+        guardedStart(
+          ThreadId.make("thread-turn-start-missing"),
+          "cmd-turn-start-missing",
+          futureSequence,
+        ),
+      );
+
+      const bootstrapThreadId = ThreadId.make("thread-turn-start-bootstrap");
+      yield* prepareReadyThread(bootstrapThreadId);
+      const bootstrapSequence = yield* engine.latestSequence;
+      const bootstrapCommand = {
+        ...guardedStart(bootstrapThreadId, "cmd-turn-start-bootstrap", bootstrapSequence),
+        bootstrap: { runSetupScript: true },
+      };
+      yield* rejectWithoutAppend(bootstrapCommand);
+
+      const startingThreadId = ThreadId.make("thread-turn-start-starting");
+      yield* prepareReadyThread(startingThreadId);
+      yield* engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-turn-start-starting-session"),
+        threadId: startingThreadId,
+        createdAt,
+        session: {
+          threadId: startingThreadId,
+          status: "starting",
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: createdAt,
+        },
+      });
+      yield* rejectWithoutAppend(
+        guardedStart(startingThreadId, "cmd-turn-start-starting", yield* engine.latestSequence),
+      );
+
+      const runningThreadId = ThreadId.make("thread-turn-start-running");
+      yield* prepareReadyThread(runningThreadId);
+      yield* engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-turn-start-running-session"),
+        threadId: runningThreadId,
+        createdAt,
+        session: {
+          threadId: runningThreadId,
+          status: "running",
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: TurnId.make("turn-turn-start-running"),
+          lastError: null,
+          updatedAt: createdAt,
+        },
+      });
+      yield* rejectWithoutAppend(
+        guardedStart(runningThreadId, "cmd-turn-start-running", yield* engine.latestSequence),
+      );
+
+      const activeTurnThreadId = ThreadId.make("thread-turn-start-active-turn");
+      yield* prepareReadyThread(activeTurnThreadId);
+      yield* engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-turn-start-active-turn-session"),
+        threadId: activeTurnThreadId,
+        createdAt,
+        session: {
+          threadId: activeTurnThreadId,
+          status: "ready",
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: TurnId.make("turn-turn-start-active"),
+          lastError: null,
+          updatedAt: createdAt,
+        },
+      });
+      yield* rejectWithoutAppend(
+        guardedStart(
+          activeTurnThreadId,
+          "cmd-turn-start-active-turn",
+          yield* engine.latestSequence,
+        ),
+      );
+
+      const pendingThreadId = ThreadId.make("thread-turn-start-pending");
+      yield* prepareReadyThread(pendingThreadId);
+      yield* engine.dispatch({
+        type: "thread.activity.append",
+        commandId: CommandId.make("cmd-turn-start-pending-approval"),
+        threadId: pendingThreadId,
+        createdAt,
+        activity: {
+          id: EventId.make("activity-turn-start-pending-approval"),
+          kind: "approval.requested",
+          summary: "Approval requested",
+          tone: "approval",
+          turnId: null,
+          createdAt,
+          payload: {
+            requestId: "approval-turn-start-pending",
+            requestKind: "command",
+            detail: "Approve the pending command.",
+          },
+        },
+      });
+      expect(
+        Option.getOrThrow(yield* snapshots.getThreadShellById(pendingThreadId)).hasPendingApprovals,
+      ).toBe(true);
+      yield* rejectWithoutAppend(
+        guardedStart(pendingThreadId, "cmd-turn-start-pending", yield* engine.latestSequence),
+      );
+
+      const pendingInputThreadId = ThreadId.make("thread-turn-start-pending-input");
+      yield* prepareReadyThread(pendingInputThreadId);
+      const pendingInputAppendReceipt = yield* engine.dispatch({
+        type: "thread.activity.append",
+        commandId: CommandId.make("cmd-turn-start-pending-input-append"),
+        threadId: pendingInputThreadId,
+        createdAt,
+        activity: {
+          id: EventId.make("activity-turn-start-pending-input"),
+          kind: "user-input.requested",
+          summary: "Input requested",
+          tone: "info",
+          turnId: null,
+          createdAt,
+          payload: {
+            requestId: "input-turn-start-pending",
+            responseMode: "message",
+            questions: [
+              {
+                id: "continue",
+                header: "Continue",
+                question: "Continue the current work?",
+                options: [{ label: "yes", description: "Continue" }],
+              },
+            ],
+          },
+        },
+      });
+      const pendingInputDetail = yield* snapshots.getThreadDetailSnapshot(pendingInputThreadId);
+      expect(pendingInputAppendReceipt.sequence).toBe(yield* engine.latestSequence);
+      expect(
+        Option.getOrThrow(pendingInputDetail).thread.activities.some(
+          (activity) => activity.id === EventId.make("activity-turn-start-pending-input"),
+        ),
+      ).toBe(true);
+      expect(
+        Option.getOrThrow(yield* snapshots.getThreadShellById(pendingInputThreadId))
+          .hasPendingUserInput,
+      ).toBe(true);
+      yield* rejectWithoutAppend(
+        guardedStart(
+          pendingInputThreadId,
+          "cmd-turn-start-pending-input",
+          yield* engine.latestSequence,
+        ),
+      );
+
+      for (const queuedCase of [
+        {
+          name: "ready-at-clock-equality",
+          status: "ready" as const,
+          queuedAt,
+          clockAt: queuedAt,
+        },
+        {
+          name: "error-at-clock-equality",
+          status: "error" as const,
+          queuedAt,
+          clockAt: queuedAt,
+        },
+        {
+          name: "stopped-with-old-message",
+          status: "stopped" as const,
+          queuedAt: "2025-12-31T23:57:00.000Z",
+          clockAt: createdAt,
+        },
+      ]) {
+        const threadId = ThreadId.make(`thread-turn-start-queued-${queuedCase.name}`);
+        yield* prepareReadyThread(threadId);
+        if (queuedCase.status !== "ready") {
+          yield* engine.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make(`cmd-turn-start-queued-${queuedCase.name}-session`),
+            threadId,
+            createdAt,
+            session: {
+              threadId,
+              status: queuedCase.status,
+              providerName: "codex",
+              runtimeMode: "full-access",
+              activeTurnId: null,
+              lastError: queuedCase.status === "error" ? "failed" : null,
+              updatedAt: createdAt,
+            },
+          });
+        }
+        yield* TestClock.setTime(Date.parse(queuedCase.clockAt));
+        yield* engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make(`cmd-turn-start-queued-${queuedCase.name}-work`),
+          threadId,
+          message: {
+            messageId: MessageId.make(`message-turn-start-queued-${queuedCase.name}-work`),
+            role: "user",
+            text: "queued work",
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "full-access",
+          createdAt: queuedCase.queuedAt,
+        });
+        yield* rejectWithoutAppend(
+          guardedStart(
+            threadId,
+            `cmd-turn-start-queued-${queuedCase.name}`,
+            yield* engine.latestSequence,
+            queuedCase.queuedAt,
+          ),
+        );
+      }
+
+      const liveThreadId = ThreadId.make("thread-turn-start-live");
+      yield* prepareReadyThread(liveThreadId);
+      backgroundLiveness.recordTaskLiveness({
+        threadId: liveThreadId,
+        taskId: "task-turn-start-live",
+        taskType: "subagent",
+        status: undefined,
+        kind: "started",
+      });
+      yield* rejectWithoutAppend(
+        guardedStart(liveThreadId, "cmd-turn-start-live", yield* engine.latestSequence),
+      );
       backgroundLiveness.clearThreadLiveness(liveThreadId);
     }).pipe(Effect.provide(makeOrchestrationLayer())),
   );

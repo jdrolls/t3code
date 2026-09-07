@@ -257,6 +257,43 @@ it.effect("decodes thread.turn.start defaults for provider and runtime mode", ()
   }),
 );
 
+it.effect("accepts guarded thread turn starts from server and client schemas", () =>
+  Effect.gen(function* () {
+    const command = {
+      type: "thread.turn.start" as const,
+      commandId: "cmd-guarded-turn-start",
+      threadId: "thread-1",
+      message: {
+        messageId: "message-1",
+        role: "user" as const,
+        text: "continue",
+        attachments: [],
+      },
+      runtimeMode: "full-access" as const,
+      interactionMode: "default" as const,
+      expectedSnapshotSequence: 3,
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+
+    const serverCommand = yield* decodeThreadTurnStartCommand(command);
+    const clientCommand = yield* requireClientCommand(command);
+    assert.strictEqual(serverCommand.expectedSnapshotSequence, 3);
+    if (clientCommand.type !== "thread.turn.start") {
+      assert.fail(`Expected thread.turn.start, received ${clientCommand.type}.`);
+    }
+    assert.strictEqual(clientCommand.expectedSnapshotSequence, 3);
+
+    for (const expectedSnapshotSequence of [-1, 1.5]) {
+      const invalid = { ...command, expectedSnapshotSequence };
+      assert.strictEqual(
+        (yield* Effect.exit(decodeThreadTurnStartCommand(invalid)))._tag,
+        "Failure",
+      );
+      assert.strictEqual((yield* Effect.exit(requireClientCommand(invalid)))._tag, "Failure");
+    }
+  }),
+);
+
 it.effect("accepts inline images, uploaded images, and uploaded files from clients", () =>
   Effect.gen(function* () {
     const command = yield* requireClientCommand({
@@ -989,9 +1026,9 @@ it.effect("decodes thread.turn-start-requested title seed when present", () =>
   }),
 );
 
-it.effect("decodes latest turn source proposed plan metadata when present", () =>
+it.effect("decodes latest turn source proposed plan and request message metadata", () =>
   Effect.gen(function* () {
-    const parsed = yield* decodeOrchestrationLatestTurn({
+    const base = {
       turnId: "turn-2",
       state: "running",
       requestedAt: "2026-01-01T00:00:00.000Z",
@@ -1002,11 +1039,24 @@ it.effect("decodes latest turn source proposed plan metadata when present", () =
         threadId: "thread-1",
         planId: "plan-1",
       },
+    };
+    const parsed = yield* decodeOrchestrationLatestTurn({
+      ...base,
+      requestMessageId: "message-1",
     });
+    assert.strictEqual(parsed.requestMessageId, "message-1");
     assert.deepStrictEqual(parsed.sourceProposedPlan, {
       threadId: "thread-1",
       planId: "plan-1",
     });
+
+    const historical = yield* decodeOrchestrationLatestTurn(base);
+    const explicitNull = yield* decodeOrchestrationLatestTurn({
+      ...base,
+      requestMessageId: null,
+    });
+    assert.strictEqual(historical.requestMessageId, undefined);
+    assert.strictEqual(explicitNull.requestMessageId, null);
   }),
 );
 
