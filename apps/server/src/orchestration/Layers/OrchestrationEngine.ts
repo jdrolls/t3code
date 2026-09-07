@@ -22,6 +22,7 @@ import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import * as SqlSchema from "effect/unstable/sql/SqlSchema";
 
 import {
   metricAttributes,
@@ -95,6 +96,20 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const threadBackgroundLiveness = yield* ThreadBackgroundLivenessService;
   const crypto = yield* Crypto.Crypto;
+  const getPendingTurnStart = SqlSchema.findOneOption({
+    Request: Schema.Struct({ threadId: Schema.String }),
+    Result: Schema.Struct({ pending: Schema.Literal(1) }),
+    execute: ({ threadId }) => sql`
+      SELECT 1 AS "pending"
+      FROM projection_turns
+      WHERE thread_id = ${threadId}
+        AND turn_id IS NULL
+        AND state = 'pending'
+        AND pending_message_id IS NOT NULL
+        AND checkpoint_turn_count IS NULL
+      LIMIT 1
+    `,
+  });
 
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   let commandReadModel = createEmptyReadModel(yield* nowIso);
@@ -279,51 +294,162 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           });
         }
 
-        const guardedSettlement =
+        const guardedThreadOperation =
           envelope.command.type === "thread.auto-settle"
             ? {
+                kind: "settlement" as const,
                 threadId: envelope.command.threadId,
                 expectedSnapshotSequence: envelope.command.snapshotSequence,
               }
             : envelope.command.type === "thread.settle" &&
                 envelope.command.expectedSnapshotSequence !== undefined
               ? {
+                  kind: "settlement" as const,
                   threadId: envelope.command.threadId,
                   expectedSnapshotSequence: envelope.command.expectedSnapshotSequence,
                 }
-              : undefined;
+              : envelope.command.type === "thread.turn.start" &&
+                  envelope.command.expectedSnapshotSequence !== undefined
+                ? {
+                    kind: "turn-start" as const,
+                    threadId: envelope.command.threadId,
+                    expectedSnapshotSequence: envelope.command.expectedSnapshotSequence,
+                  }
+                : undefined;
         if (
-          guardedSettlement !== undefined &&
-          guardedSettlement.expectedSnapshotSequence > commandReadModel.snapshotSequence
+          guardedThreadOperation !== undefined &&
+          guardedThreadOperation.expectedSnapshotSequence > commandReadModel.snapshotSequence
         ) {
           return yield* new OrchestrationCommandInvariantError({
             commandType: envelope.command.type,
-            detail: `thread ${guardedSettlement.threadId} settlement snapshot is ahead of the authoritative sequence`,
+            detail: `thread ${guardedThreadOperation.threadId} guarded snapshot is ahead of the authoritative sequence`,
           });
         }
 
         if (
-          guardedSettlement !== undefined &&
+          guardedThreadOperation !== undefined &&
           (yield* eventStore.hasEventAfter({
             aggregateKind: "thread",
-            aggregateId: guardedSettlement.threadId,
-            sequenceExclusive: guardedSettlement.expectedSnapshotSequence,
+            aggregateId: guardedThreadOperation.threadId,
+            sequenceExclusive: guardedThreadOperation.expectedSnapshotSequence,
           }))
         ) {
           return yield* new OrchestrationCommandInvariantError({
             commandType: envelope.command.type,
-            detail: `thread ${guardedSettlement.threadId} changed before guarded settlement`,
+            detail: `thread ${guardedThreadOperation.threadId} changed before guarded ${guardedThreadOperation.kind}`,
           });
         }
 
         if (
-          guardedSettlement !== undefined &&
-          threadBackgroundLiveness.getThreadBackgroundLiveness(guardedSettlement.threadId) !== null
+          guardedThreadOperation !== undefined &&
+          threadBackgroundLiveness.getThreadBackgroundLiveness(guardedThreadOperation.threadId) !==
+            null
         ) {
           return yield* new OrchestrationCommandInvariantError({
             commandType: envelope.command.type,
-            detail: `thread ${guardedSettlement.threadId} has live background work`,
+            detail: `thread ${guardedThreadOperation.threadId} has live background work`,
           });
+        }
+
+        if (guardedThreadOperation?.kind === "turn-start") {
+          if (envelope.command.type !== "thread.turn.start") {
+            return yield* new OrchestrationCommandInvariantError({
+              commandType: envelope.command.type,
+              detail: "Guarded turn start command type mismatch.",
+            });
+          }
+          if (envelope.command.bootstrap !== undefined) {
+            return yield* new OrchestrationCommandInvariantError({
+              commandType: envelope.command.type,
+              detail: `thread ${guardedThreadOperation.threadId} guarded turn start cannot bootstrap a thread`,
+            });
+          }
+          const thread = commandReadModel.threads.find(
+            (candidate) => candidate.id === guardedThreadOperation.threadId,
+          );
+          if (thread === undefined || thread.deletedAt !== null || thread.archivedAt !== null) {
+            return yield* new OrchestrationCommandInvariantError({
+              commandType: envelope.command.type,
+              detail: `thread ${guardedThreadOperation.threadId} does not have an existing active binding`,
+            });
+          }
+          const threadShell = yield* projectionSnapshotQuery
+            .getThreadShellById(guardedThreadOperation.threadId)
+            .pipe(
+              Effect.mapError(
+                (cause) =>
+                  new OrchestrationCommandInvariantError({
+                    commandType: envelope.command.type,
+                    detail: `thread ${guardedThreadOperation.threadId} terminal state is unavailable`,
+                    cause,
+                  }),
+              ),
+            );
+          if (Option.isNone(threadShell)) {
+            return yield* new OrchestrationCommandInvariantError({
+              commandType: envelope.command.type,
+              detail: `thread ${guardedThreadOperation.threadId} does not have an existing active binding`,
+            });
+          }
+          const terminalThread = threadShell.value;
+          const terminalSession = terminalThread.session;
+          const terminalTurn = terminalThread.latestTurn;
+          if (
+            terminalSession === null ||
+            terminalSession.status === "starting" ||
+            terminalSession.status === "running" ||
+            terminalSession.activeTurnId !== null
+          ) {
+            return yield* new OrchestrationCommandInvariantError({
+              commandType: envelope.command.type,
+              detail: `thread ${guardedThreadOperation.threadId} has an active session or turn`,
+            });
+          }
+          if (
+            terminalTurn === null ||
+            terminalTurn.state === "running" ||
+            terminalTurn.completedAt === null
+          ) {
+            return yield* new OrchestrationCommandInvariantError({
+              commandType: envelope.command.type,
+              detail: `thread ${guardedThreadOperation.threadId} does not have a completed terminal turn`,
+            });
+          }
+          if (
+            terminalSession.status !== "error" &&
+            terminalSession.status !== "stopped" &&
+            terminalSession.status !== "interrupted" &&
+            !(terminalSession.status === "ready" && terminalTurn.state === "completed")
+          ) {
+            return yield* new OrchestrationCommandInvariantError({
+              commandType: envelope.command.type,
+              detail: `thread ${guardedThreadOperation.threadId} does not have a terminal session binding`,
+            });
+          }
+          if (terminalThread.hasPendingApprovals || terminalThread.hasPendingUserInput) {
+            return yield* new OrchestrationCommandInvariantError({
+              commandType: envelope.command.type,
+              detail: `thread ${guardedThreadOperation.threadId} has pending approval or user input`,
+            });
+          }
+          const pendingTurnStart = yield* getPendingTurnStart({
+            threadId: guardedThreadOperation.threadId,
+          }).pipe(
+            Effect.mapError(
+              (cause) =>
+                new OrchestrationCommandInvariantError({
+                  commandType: envelope.command.type,
+                  detail: `thread ${guardedThreadOperation.threadId} pending turn state is unavailable`,
+                  cause,
+                }),
+            ),
+          );
+          if (Option.isSome(pendingTurnStart)) {
+            return yield* new OrchestrationCommandInvariantError({
+              commandType: envelope.command.type,
+              detail: `thread ${guardedThreadOperation.threadId} has a queued turn start`,
+            });
+          }
         }
 
         // Command snapshots omit activities at startup and cap them while running.

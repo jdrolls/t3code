@@ -11,6 +11,7 @@ import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
@@ -322,6 +323,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
             startedAt: "2026-02-24T00:00:08.000Z",
             completedAt: "2026-02-24T00:00:08.000Z",
             assistantMessageId: asMessageId("message-1"),
+            requestMessageId: null,
             sourceProposedPlan: {
               threadId: ThreadId.make("thread-1"),
               planId: "plan-1",
@@ -451,6 +453,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
             startedAt: "2026-02-24T00:00:08.000Z",
             completedAt: "2026-02-24T00:00:08.000Z",
             assistantMessageId: asMessageId("message-1"),
+            requestMessageId: null,
             sourceProposedPlan: {
               threadId: ThreadId.make("thread-1"),
               planId: "plan-1",
@@ -1973,6 +1976,124 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
         (yield* snapshotQuery.searchThreads({ query: "user needle" })).matches,
         [],
       );
+    }),
+  );
+
+  it.effect("publishes persisted latest turn request message identity across read models", () =>
+    Effect.gen(function* () {
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+      const requestedAt = "2026-06-01T00:00:00.000Z";
+
+      yield* sql`DELETE FROM projection_projects`;
+      yield* sql`DELETE FROM projection_threads`;
+      yield* sql`DELETE FROM projection_turns`;
+      yield* sql`
+        INSERT INTO projection_projects (
+          project_id, title, workspace_root, default_model_selection_json, scripts_json,
+          created_at, updated_at, deleted_at
+        )
+        VALUES (
+          'project-request-identity', 'Request identity', '/tmp/request-identity',
+          '{"provider":"codex","model":"gpt-5-codex"}', '[]',
+          ${requestedAt}, ${requestedAt}, NULL
+        )
+      `;
+      yield* sql`
+        INSERT INTO projection_threads (
+          thread_id, project_id, title, model_selection_json, runtime_mode, interaction_mode,
+          branch, worktree_path, latest_turn_id, latest_user_message_at,
+          pending_approval_count, pending_user_input_count, has_actionable_proposed_plan,
+          created_at, updated_at, archived_at, deleted_at
+        )
+        VALUES
+          (
+            'thread-request-running', 'project-request-identity', 'Running request',
+            '{"provider":"codex","model":"gpt-5-codex"}', 'full-access', 'default',
+            NULL, NULL, 'turn-request-running', NULL, 0, 0, 0,
+            ${requestedAt}, ${requestedAt}, NULL, NULL
+          ),
+          (
+            'thread-request-completed', 'project-request-identity', 'Completed request',
+            '{"provider":"codex","model":"gpt-5-codex"}', 'full-access', 'default',
+            NULL, NULL, 'turn-request-completed', NULL, 0, 0, 0,
+            ${requestedAt}, ${requestedAt}, NULL, NULL
+          ),
+          (
+            'thread-request-historical', 'project-request-identity', 'Historical request',
+            '{"provider":"codex","model":"gpt-5-codex"}', 'full-access', 'default',
+            NULL, NULL, 'turn-request-historical', NULL, 0, 0, 0,
+            ${requestedAt}, ${requestedAt}, NULL, NULL
+          )
+      `;
+      yield* sql`
+        INSERT INTO projection_turns (
+          thread_id, turn_id, pending_message_id, assistant_message_id, state,
+          requested_at, started_at, completed_at, checkpoint_files_json
+        )
+        VALUES
+          (
+            'thread-request-running', 'turn-request-running', 'request-message-running', NULL,
+            'running', ${requestedAt}, ${requestedAt}, NULL, '[]'
+          ),
+          (
+            'thread-request-completed', 'turn-request-completed', 'request-message-completed',
+            'assistant-message-completed', 'completed', ${requestedAt}, ${requestedAt},
+            ${requestedAt}, '[]'
+          ),
+          (
+            'thread-request-historical', 'turn-request-historical', NULL, NULL,
+            'completed', ${requestedAt}, ${requestedAt}, ${requestedAt}, '[]'
+          )
+      `;
+
+      const [
+        snapshot,
+        commandReadModel,
+        shellSnapshot,
+        runningDetail,
+        completedDetail,
+        historicalDetail,
+      ] = yield* Effect.all([
+        snapshotQuery.getSnapshot(),
+        snapshotQuery.getCommandReadModel(),
+        snapshotQuery.getShellSnapshot(),
+        snapshotQuery.getThreadDetailSnapshot(ThreadId.make("thread-request-running")),
+        snapshotQuery.getThreadDetailSnapshot(ThreadId.make("thread-request-completed")),
+        snapshotQuery.getThreadDetailSnapshot(ThreadId.make("thread-request-historical")),
+      ]);
+      const requestMessageIdByThread = (
+        threads: ReadonlyArray<{
+          id: ThreadId;
+          latestTurn: { requestMessageId?: MessageId | null } | null;
+        }>,
+      ) => new Map(threads.map((thread) => [thread.id, thread.latestTurn?.requestMessageId]));
+      const runningThreadId = ThreadId.make("thread-request-running");
+      const completedThreadId = ThreadId.make("thread-request-completed");
+
+      for (const requestMessageIds of [
+        requestMessageIdByThread(snapshot.threads),
+        requestMessageIdByThread(commandReadModel.threads),
+        requestMessageIdByThread(shellSnapshot.threads),
+      ]) {
+        assert.equal(
+          requestMessageIds.get(runningThreadId),
+          asMessageId("request-message-running"),
+        );
+        assert.equal(
+          requestMessageIds.get(completedThreadId),
+          asMessageId("request-message-completed"),
+        );
+      }
+      assert.equal(
+        Option.getOrThrow(runningDetail).thread.latestTurn?.requestMessageId,
+        asMessageId("request-message-running"),
+      );
+      assert.equal(
+        Option.getOrThrow(completedDetail).thread.latestTurn?.requestMessageId,
+        asMessageId("request-message-completed"),
+      );
+      assert.equal(Option.getOrThrow(historicalDetail).thread.latestTurn?.requestMessageId, null);
     }),
   );
 });
