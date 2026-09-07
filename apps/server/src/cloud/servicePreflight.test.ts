@@ -1,8 +1,6 @@
 import { expect, it } from "@effect/vitest";
 
-import {
-  SERVICE_LAUNCHER_PROTOCOL as NODE_SERVICE_LAUNCHER_PROTOCOL,
-} from "../../../../scripts/lib/service-launcher-protocol.mjs";
+import { SERVICE_LAUNCHER_PROTOCOL as NODE_SERVICE_LAUNCHER_PROTOCOL } from "../../../../scripts/lib/service-launcher-protocol.mjs";
 
 import { runServicePreflight } from "./servicePreflight.ts";
 import { SERVICE_LAUNCHER_PROTOCOL } from "./serviceProtocol.ts";

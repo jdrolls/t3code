@@ -6,6 +6,7 @@ import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hos
 
 import {
   AuthAccessTokenType,
+  AuthDoraControlPlaneScope,
   AuthStandardClientScopes,
   AuthEnvironmentBootstrapTokenType,
   AuthTokenExchangeGrantType,
@@ -108,6 +109,7 @@ import * as Keybindings from "./keybindings.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
+import { isAuthenticatedDoraActivityCapability } from "./orchestration/DoraActivityAuthorization.ts";
 import {
   OrchestrationListenerCallbackError,
   OrchestrationThreadSettleBlockedError,
@@ -1706,6 +1708,115 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
 
       assert.equal(response.status, 200);
       assert.equal(snapshot.thread.id, threadId);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("mints a Dora HTTP dispatch capability only for control-plane sessions", () =>
+    Effect.gen(function* () {
+      const dispatched: Array<{
+        readonly command: OrchestrationCommand;
+        readonly capability: unknown;
+      }> = [];
+      const threadId = ThreadId.make("thread-dora-http");
+      const providerInstanceId = ProviderInstanceId.make("dora");
+      const providerSessionId = "dora-session-http";
+      const dispatchUrl = yield* getHttpServerUrl("/api/orchestration/dispatch");
+      const doraCommand = (commandId: string) => ({
+        type: "thread.activity.append",
+        commandId,
+        threadId,
+        providerInstanceId,
+        providerSessionId,
+        activity: {
+          id: `activity-${commandId}`,
+          tone: "info",
+          kind: "dora.verification",
+          summary: "HTTP dispatch verified",
+          payload: { suite: "orchestration-http" },
+          turnId: null,
+          createdAt: "2026-01-01T00:00:00.000Z",
+        },
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationEngine: {
+            dispatch: (command, options) =>
+              Effect.sync(() => {
+                dispatched.push({ command, capability: options?.doraActivityCapability });
+                return { sequence: 7 };
+              }),
+          },
+        },
+      });
+
+      const authorizedResponse = yield* fetchEffect(dispatchUrl, {
+        method: "POST",
+        headers: {
+          cookie: yield* getAuthenticatedSessionCookieHeader(),
+          "content-type": "application/json",
+        },
+        body: jsonRequestBody(doraCommand("cmd-dora-http-authorized")),
+      });
+      const authorizedBody = yield* responseJsonEffect<{ readonly sequence?: number }>(
+        authorizedResponse,
+      );
+      assert.equal(authorizedResponse.status, 200);
+      assert.equal(authorizedBody.sequence, 7);
+      assert.lengthOf(dispatched, 1);
+      const capability = dispatched[0]?.capability;
+      assert.isTrue(isAuthenticatedDoraActivityCapability(capability));
+      if (isAuthenticatedDoraActivityCapability(capability)) {
+        assert.deepEqual(capability, {
+          threadId,
+          providerInstanceId,
+          providerSessionId,
+        });
+        assert.deepEqual(Object.keys(capability).toSorted(), [
+          "providerInstanceId",
+          "providerSessionId",
+          "threadId",
+        ]);
+      }
+
+      const limitedToken = yield* getAuthenticatedBearerSessionToken();
+      const ordinaryResponse = yield* fetchEffect(dispatchUrl, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${limitedToken}`,
+          "content-type": "application/json",
+        },
+        body: jsonRequestBody({
+          type: "thread.session.stop",
+          commandId: "cmd-non-dora-http",
+          threadId,
+          createdAt: "2026-01-01T00:00:00.000Z",
+        }),
+      });
+      assert.equal(ordinaryResponse.status, 200);
+      assert.lengthOf(dispatched, 2);
+      assert.equal(dispatched[1]?.command.type, "thread.session.stop");
+      assert.isUndefined(dispatched[1]?.capability);
+
+      const unauthorizedResponse = yield* fetchEffect(dispatchUrl, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${limitedToken}`,
+          "content-type": "application/json",
+        },
+        body: jsonRequestBody(doraCommand("cmd-dora-http-no-control-plane")),
+      });
+      const unauthorizedBody = yield* responseJsonEffect<{
+        readonly _tag?: string;
+        readonly code?: string;
+        readonly requiredScope?: string;
+      }>(unauthorizedResponse);
+      assert.equal(unauthorizedResponse.status, 403);
+      assert.equal(unauthorizedBody._tag, "EnvironmentScopeRequiredError");
+      assert.equal(unauthorizedBody.code, "insufficient_scope");
+      assert.equal(unauthorizedBody.requiredScope, AuthDoraControlPlaneScope);
+      assert.lengthOf(dispatched, 2);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

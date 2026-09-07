@@ -1,13 +1,18 @@
 import {
+  AuthDoraControlPlaneScope,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
+  DoraClientThreadActivityAppendCommand,
   EnvironmentHttpApi,
+  type OrchestrationCommand,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 
 import { projectThreadDetailSnapshot } from "./ActivityPayloadProjection.ts";
+import { createAuthenticatedDoraActivityCapability } from "./DoraActivityAuthorization.ts";
 import { cleanupFailedUploadedAttachments, normalizeDispatchCommand } from "./Normalizer.ts";
 import {
   annotateEnvironmentRequest,
@@ -18,6 +23,13 @@ import {
 } from "../auth/http.ts";
 import { OrchestrationEngineService } from "./Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
+
+const isDoraClientThreadActivityAppendCommand = Schema.is(DoraClientThreadActivityAppendCommand);
+
+const isDoraControlPlaneActivity = (
+  command: OrchestrationCommand,
+): command is DoraClientThreadActivityAppendCommand =>
+  isDoraClientThreadActivityAppendCommand(command);
 
 export const orchestrationHttpApiLayer = HttpApiBuilder.group(
   EnvironmentHttpApi,
@@ -96,7 +108,22 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
           const normalizedCommand = yield* normalizeDispatchCommand(args.payload).pipe(
             Effect.catch(() => failEnvironmentInvalidRequest("invalid_command")),
           );
-          return yield* orchestrationEngine.dispatch(normalizedCommand).pipe(
+          let doraActivityCapability:
+            | ReturnType<typeof createAuthenticatedDoraActivityCapability>
+            | undefined;
+          if (isDoraControlPlaneActivity(normalizedCommand)) {
+            yield* requireEnvironmentScope(AuthDoraControlPlaneScope);
+            doraActivityCapability = createAuthenticatedDoraActivityCapability({
+              threadId: normalizedCommand.threadId,
+              providerInstanceId: normalizedCommand.providerInstanceId,
+              providerSessionId: normalizedCommand.providerSessionId,
+            });
+          }
+          const dispatch =
+            doraActivityCapability === undefined
+              ? orchestrationEngine.dispatch(normalizedCommand)
+              : orchestrationEngine.dispatch(normalizedCommand, { doraActivityCapability });
+          return yield* dispatch.pipe(
             Effect.tapError(() =>
               cleanupFailedUploadedAttachments(args.payload, normalizedCommand),
             ),

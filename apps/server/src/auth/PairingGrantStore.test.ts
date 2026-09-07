@@ -153,6 +153,7 @@ it.layer(NodeServices.layer)("PairingGrantStore.layer", (it) => {
         "terminal:operate",
         "review:write",
         "relay:read",
+        "dora:control-plane",
         "access:read",
         "access:write",
         "relay:write",

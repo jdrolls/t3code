@@ -7,6 +7,8 @@ import {
   DEFAULT_PROVIDER_INTERACTION_MODE,
   DEFAULT_RUNTIME_MODE,
   ClientOrchestrationCommand,
+  DispatchableClientOrchestrationCommand,
+  DoraClientThreadActivityAppendCommand,
   ModelSelection,
   OrchestrationCommand,
   OrchestrationDispatchCommandError,
@@ -40,7 +42,13 @@ const decodeProjectCreateCommand = Schema.decodeUnknownEffect(ProjectCreateComma
 const decodeProjectCreatedPayload = Schema.decodeUnknownEffect(ProjectCreatedPayload);
 const decodeProjectMetaUpdatedPayload = Schema.decodeUnknownEffect(ProjectMetaUpdatedPayload);
 const decodeThreadTurnStartCommand = Schema.decodeUnknownEffect(ThreadTurnStartCommand);
-const decodeClientOrchestrationCommand = Schema.decodeUnknownEffect(ClientOrchestrationCommand);
+const decodeDoraClientThreadActivityAppendCommand = Schema.decodeUnknownEffect(
+  DoraClientThreadActivityAppendCommand,
+);
+const requireClientCommand = Schema.decodeUnknownEffect(ClientOrchestrationCommand);
+const decodeDispatchableClientOrchestrationCommand = Schema.decodeUnknownEffect(
+  DispatchableClientOrchestrationCommand,
+);
 const decodeOrchestrationMessage = Schema.decodeUnknownEffect(OrchestrationMessage);
 const decodeThreadMessageSentPayload = Schema.decodeUnknownEffect(ThreadMessageSentPayload);
 const decodeThreadTurnStartRequestedPayload = Schema.decodeUnknownEffect(
@@ -251,7 +259,7 @@ it.effect("decodes thread.turn.start defaults for provider and runtime mode", ()
 
 it.effect("accepts inline images, uploaded images, and uploaded files from clients", () =>
   Effect.gen(function* () {
-    const command = yield* decodeClientOrchestrationCommand({
+    const command = yield* requireClientCommand({
       type: "thread.turn.start",
       commandId: "cmd-turn-attachments",
       threadId: "thread-1",
@@ -295,6 +303,50 @@ it.effect("accepts inline images, uploaded images, and uploaded files from clien
     assert.strictEqual("dataUrl" in command.message.attachments[0]!, true);
     assert.strictEqual("id" in command.message.attachments[1]!, true);
     assert.strictEqual(command.message.attachments[2]!.type, "file");
+  }),
+);
+
+it.effect("accepts only Dora projection activity commands from clients", () =>
+  Effect.gen(function* () {
+    const command = {
+      type: "thread.activity.append",
+      commandId: "cmd-dora-activity",
+      threadId: "thread-1",
+      providerInstanceId: "dora",
+      providerSessionId: "dora-session-1",
+      activity: {
+        id: "activity-dora-1",
+        tone: "info",
+        kind: "dora.verification",
+        summary: "Verification completed",
+        payload: { suite: "normalizer" },
+        turnId: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+
+    const client = yield* requireClientCommand(command);
+    const dispatchable = yield* decodeDispatchableClientOrchestrationCommand(command);
+    const doraAppend = yield* decodeDoraClientThreadActivityAppendCommand(command);
+    assert.strictEqual(client.type, "thread.activity.append");
+    assert.strictEqual(dispatchable.type, "thread.activity.append");
+    assert.strictEqual(doraAppend.providerInstanceId, "dora");
+    assert.strictEqual(doraAppend.providerSessionId, "dora-session-1");
+
+    for (const invalidCommand of [
+      { ...command, providerInstanceId: undefined },
+      { ...command, providerInstanceId: "1invalid" },
+      { ...command, providerSessionId: undefined },
+      { ...command, providerSessionId: "not a session id" },
+      { ...command, activity: { ...command.activity, kind: "tool.completed" } },
+      { ...command, activity: { ...command.activity, tone: "approval" } },
+      { ...command, activity: { ...command.activity, turnId: "turn-1" } },
+      { ...command, activity: { ...command.activity, summary: "x".repeat(2_001) } },
+    ]) {
+      const result = yield* Effect.exit(requireClientCommand(invalidCommand));
+      assert.strictEqual(result._tag, "Failure");
+    }
   }),
 );
 
@@ -989,7 +1041,7 @@ it.effect("accepts only bounded opaque provider session ids", () =>
   }),
 );
 
-it.effect("defaults proposed plan implementation metadata for historical rows",  () =>
+it.effect("defaults proposed plan implementation metadata for historical rows", () =>
   Effect.gen(function* () {
     const parsed = yield* decodeOrchestrationProposedPlan({
       id: "plan-1",

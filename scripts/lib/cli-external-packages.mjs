@@ -61,10 +61,7 @@ export const CLI_RUNTIME_EXTERNAL_PREFIXES = [
  * bundling for Node. Because Node never loads them, their dependency closure
  * does not need to be external — only the entry point must stay unbundled.
  */
-export const CLI_BUILD_ONLY_EXTERNAL_PREFIXES = [
-  "@effect/platform-bun",
-  "@effect/sql-sqlite-bun",
-];
+export const CLI_BUILD_ONLY_EXTERNAL_PREFIXES = ["@effect/platform-bun", "@effect/sql-sqlite-bun"];
 
 export const CLI_EXTERNAL_PACKAGE_PREFIXES = [
   ...CLI_RUNTIME_EXTERNAL_PREFIXES,

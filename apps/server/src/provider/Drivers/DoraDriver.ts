@@ -18,7 +18,7 @@ import {
   type ProviderDriver,
   type ProviderInstance,
 } from "../ProviderDriver.ts";
-import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
+import type { ServerProviderShape } from "../Services/ServerProvider.ts";
 import { buildServerProvider } from "../providerSnapshot.ts";
 import { makeManualOnlyProviderMaintenanceCapabilities } from "../providerMaintenance.ts";
 
@@ -26,9 +26,15 @@ const DRIVER_KIND = ProviderDriverKind.make("dora");
 const decodeDoraSettings = Schema.decodeSync(DoraSettings);
 
 const unsupportedTextGeneration = (
-  operation: "generateCommitMessage" | "generatePrContent" | "generateBranchName" | "generateThreadTitle",
+  operation:
+    | "generateCommitMessage"
+    | "generatePrContent"
+    | "generateBranchName"
+    | "generateThreadTitle",
 ) =>
-  Effect.fail(new TextGenerationError({ operation, detail: "Dora does not implement text generation." }));
+  Effect.fail(
+    new TextGenerationError({ operation, detail: "Dora does not implement text generation." }),
+  );
 
 /** Dora needs no account secret or server-side credential service. */
 export type DoraDriverEnv = never;
@@ -40,7 +46,10 @@ export const DoraDriver: ProviderDriver<DoraSettings, DoraDriverEnv> = {
   defaultConfig: (): DoraSettings => decodeDoraSettings({}),
   create: ({ instanceId, displayName, accentColor, environment, enabled, config }) =>
     Effect.gen(function* () {
-      const continuationIdentity = defaultProviderContinuationIdentity({ driverKind: DRIVER_KIND, instanceId });
+      const continuationIdentity = defaultProviderContinuationIdentity({
+        driverKind: DRIVER_KIND,
+        instanceId,
+      });
       const effectiveConfig = { ...config, enabled } satisfies DoraSettings;
       const processEnv = environment?.reduce<NodeJS.ProcessEnv>((variables, { name, value }) => {
         if (typeof value === "string") variables[name] = value;
@@ -89,10 +98,15 @@ export const DoraDriver: ProviderDriver<DoraSettings, DoraDriverEnv> = {
         accentColor,
         enabled,
         snapshot: {
-          maintenanceCapabilities: makeManualOnlyProviderMaintenanceCapabilities({ provider: DRIVER_KIND, packageName: null }),
+          maintenanceCapabilities: makeManualOnlyProviderMaintenanceCapabilities({
+            provider: DRIVER_KIND,
+            packageName: null,
+          }),
           getSnapshot: Effect.succeed(snapshot),
           refresh: Effect.succeed(snapshot),
           streamChanges: Stream.empty,
+          applyUsageLimits: (_update: Parameters<ServerProviderShape["applyUsageLimits"]>[0]) =>
+            Effect.void,
         },
         adapter,
         textGeneration,

@@ -199,6 +199,7 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
         "terminal:operate",
         "review:write",
         "relay:read",
+        "dora:control-plane",
         "access:read",
         "access:write",
         "relay:write",
