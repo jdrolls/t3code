@@ -279,27 +279,50 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           });
         }
 
+        const guardedSettlement =
+          envelope.command.type === "thread.auto-settle"
+            ? {
+                threadId: envelope.command.threadId,
+                expectedSnapshotSequence: envelope.command.snapshotSequence,
+              }
+            : envelope.command.type === "thread.settle" &&
+                envelope.command.expectedSnapshotSequence !== undefined
+              ? {
+                  threadId: envelope.command.threadId,
+                  expectedSnapshotSequence: envelope.command.expectedSnapshotSequence,
+                }
+              : undefined;
         if (
-          envelope.command.type === "thread.auto-settle" &&
-          (yield* eventStore.hasEventAfter({
-            aggregateKind: "thread",
-            aggregateId: envelope.command.threadId,
-            sequenceExclusive: envelope.command.snapshotSequence,
-          }))
+          guardedSettlement !== undefined &&
+          guardedSettlement.expectedSnapshotSequence > commandReadModel.snapshotSequence
         ) {
           return yield* new OrchestrationCommandInvariantError({
             commandType: envelope.command.type,
-            detail: `thread ${envelope.command.threadId} changed before automatic settlement`,
+            detail: `thread ${guardedSettlement.threadId} settlement snapshot is ahead of the authoritative sequence`,
           });
         }
 
         if (
-          envelope.command.type === "thread.auto-settle" &&
-          threadBackgroundLiveness.getThreadBackgroundLiveness(envelope.command.threadId) !== null
+          guardedSettlement !== undefined &&
+          (yield* eventStore.hasEventAfter({
+            aggregateKind: "thread",
+            aggregateId: guardedSettlement.threadId,
+            sequenceExclusive: guardedSettlement.expectedSnapshotSequence,
+          }))
         ) {
           return yield* new OrchestrationCommandInvariantError({
             commandType: envelope.command.type,
-            detail: `thread ${envelope.command.threadId} has live background work`,
+            detail: `thread ${guardedSettlement.threadId} changed before guarded settlement`,
+          });
+        }
+
+        if (
+          guardedSettlement !== undefined &&
+          threadBackgroundLiveness.getThreadBackgroundLiveness(guardedSettlement.threadId) !== null
+        ) {
+          return yield* new OrchestrationCommandInvariantError({
+            commandType: envelope.command.type,
+            detail: `thread ${guardedSettlement.threadId} has live background work`,
           });
         }
 
