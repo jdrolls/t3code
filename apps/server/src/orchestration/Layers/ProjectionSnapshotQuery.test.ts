@@ -2065,7 +2065,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
       const requestMessageIdByThread = (
         threads: ReadonlyArray<{
           id: ThreadId;
-          latestTurn: { requestMessageId?: MessageId | null } | null;
+          latestTurn: { requestMessageId?: MessageId | null | undefined } | null;
         }>,
       ) => new Map(threads.map((thread) => [thread.id, thread.latestTurn?.requestMessageId]));
       const runningThreadId = ThreadId.make("thread-request-running");
