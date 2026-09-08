@@ -136,6 +136,10 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     if (
       !("providerInstanceId" in command) ||
       !("providerSessionId" in command) ||
+      typeof command.providerInstanceId !== "string" ||
+      command.providerInstanceId.trim().length === 0 ||
+      typeof command.providerSessionId !== "string" ||
+      command.providerSessionId.trim().length === 0 ||
       command.providerInstanceId !== capability.providerInstanceId ||
       command.providerSessionId !== capability.providerSessionId
     ) {
@@ -172,9 +176,16 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         capability.threadId === command.threadId
       );
     };
+    const isPermittedStoppedDoraActivity =
+      command.activity.kind === "dora.verification" ||
+      (command.activity.kind === "dora.side-effect" &&
+        typeof command.activity.payload === "object" &&
+        command.activity.payload !== null &&
+        !Array.isArray(command.activity.payload) &&
+        "kind" in command.activity.payload &&
+        (command.activity.payload.kind === "deployment" ||
+          command.activity.payload.kind === "close-issue"));
     const stampAtReceipt = (): OrchestrationCommand => ({
-      // The authenticated control-plane path cannot preserve a caller-controlled
-      // clock in retained activity data. Stamp both command and activity at engine receipt time.
       ...command,
       createdAt: receivedAt,
       activity: { ...command.activity, createdAt: receivedAt },
@@ -184,10 +195,6 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       return Effect.succeed(stampAtReceipt());
     }
 
-    // Provider ingestion can append activity after the session projection is
-    // durable but before this worker receives the corresponding session event.
-    // Only this otherwise-rejected Dora activity path may refresh the command
-    // model, and a lower-sequence projection can never replace newer state.
     return projectionSnapshotQuery.getCommandReadModel().pipe(
       Effect.mapError(
         (cause) =>
@@ -201,14 +208,158 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         if (persistedReadModel.snapshotSequence >= commandReadModel.snapshotSequence) {
           commandReadModel = persistedReadModel;
         }
-        return hasActiveBoundDoraSession(commandReadModel)
-          ? Effect.succeed(stampAtReceipt())
-          : Effect.fail(
-              new OrchestrationCommandInvariantError({
-                commandType: command.type,
-                detail: "Dora activity does not match an active bound Dora session.",
-              }),
+        if (hasActiveBoundDoraSession(commandReadModel)) {
+          return Effect.succeed(stampAtReceipt());
+        }
+        if (!isPermittedStoppedDoraActivity) {
+          return Effect.fail(
+            new OrchestrationCommandInvariantError({
+              commandType: command.type,
+              detail: "Dora activity does not match an active bound Dora session.",
+            }),
+          );
+        }
+        return Effect.gen(function* () {
+          const detail = yield* projectionSnapshotQuery
+            .getThreadDetailSnapshot(command.threadId)
+            .pipe(
+              Effect.mapError(
+                (cause) =>
+                  new OrchestrationCommandInvariantError({
+                    commandType: command.type,
+                    detail: "Dora stopped-session terminal state is unavailable.",
+                    cause,
+                  }),
+              ),
             );
+          const shell = yield* projectionSnapshotQuery.getThreadShellById(command.threadId).pipe(
+            Effect.mapError(
+              (cause) =>
+                new OrchestrationCommandInvariantError({
+                  commandType: command.type,
+                  detail: "Dora stopped-session terminal state is unavailable.",
+                  cause,
+                }),
+            ),
+          );
+          const currentThread = commandReadModel.threads.find(
+            (candidate) => candidate.id === command.threadId,
+          );
+          if (Option.isNone(detail) || Option.isNone(shell) || currentThread === undefined) {
+            return yield* new OrchestrationCommandInvariantError({
+              commandType: command.type,
+              detail: "Dora activity does not match a clean completed stopped Dora session.",
+            });
+          }
+          const { snapshotSequence: detailSnapshotSequence, thread } = detail.value;
+          const threadShell = shell.value;
+          const session = thread.session;
+          const currentSession = currentThread.session;
+          const shellSession = threadShell.session;
+          const latestTurn = thread.latestTurn;
+          const currentLatestTurn = currentThread.latestTurn;
+          const shellLatestTurn = threadShell.latestTurn;
+          const assistantMessage =
+            latestTurn?.assistantMessageId === null || latestTurn === null
+              ? []
+              : thread.messages.filter((message) => message.id === latestTurn.assistantMessageId);
+          const completedAtMs =
+            latestTurn?.completedAt === null
+              ? Number.NaN
+              : Date.parse(latestTurn?.completedAt ?? "");
+          if (
+            !Number.isSafeInteger(detailSnapshotSequence) ||
+            detailSnapshotSequence < 0 ||
+            detailSnapshotSequence < commandReadModel.snapshotSequence ||
+            thread.id !== command.threadId ||
+            thread.projectId !== currentThread.projectId ||
+            threadShell.id !== command.threadId ||
+            threadShell.projectId !== currentThread.projectId ||
+            thread.deletedAt !== null ||
+            thread.deletedAt !== currentThread.deletedAt ||
+            thread.archivedAt !== null ||
+            thread.archivedAt !== currentThread.archivedAt ||
+            threadShell.archivedAt !== null ||
+            threadShell.archivedAt !== currentThread.archivedAt ||
+            session === null ||
+            currentSession === null ||
+            shellSession === null ||
+            session.threadId !== command.threadId ||
+            session.threadId !== currentSession.threadId ||
+            session.threadId !== shellSession.threadId ||
+            session.status !== "stopped" ||
+            session.status !== currentSession.status ||
+            session.status !== shellSession.status ||
+            session.providerName !== "dora" ||
+            session.providerName !== currentSession.providerName ||
+            session.providerName !== shellSession.providerName ||
+            session.providerInstanceId !== capability.providerInstanceId ||
+            session.providerInstanceId !== currentSession.providerInstanceId ||
+            session.providerInstanceId !== shellSession.providerInstanceId ||
+            session.providerSessionId !== capability.providerSessionId ||
+            session.providerSessionId !== currentSession.providerSessionId ||
+            session.providerSessionId !== shellSession.providerSessionId ||
+            capability.threadId !== command.threadId ||
+            session.activeTurnId !== null ||
+            session.activeTurnId !== currentSession.activeTurnId ||
+            session.activeTurnId !== shellSession.activeTurnId ||
+            session.lastError !== null ||
+            session.lastError !== currentSession.lastError ||
+            session.lastError !== shellSession.lastError ||
+            latestTurn === null ||
+            currentLatestTurn === null ||
+            shellLatestTurn === null ||
+            latestTurn.turnId !== currentLatestTurn.turnId ||
+            latestTurn.turnId !== shellLatestTurn.turnId ||
+            latestTurn.state !== "completed" ||
+            latestTurn.state !== currentLatestTurn.state ||
+            latestTurn.state !== shellLatestTurn.state ||
+            latestTurn.completedAt !== currentLatestTurn.completedAt ||
+            latestTurn.completedAt !== shellLatestTurn.completedAt ||
+            latestTurn.assistantMessageId === null ||
+            latestTurn.assistantMessageId !== currentLatestTurn.assistantMessageId ||
+            latestTurn.assistantMessageId !== shellLatestTurn.assistantMessageId ||
+            !Number.isFinite(completedAtMs) ||
+            assistantMessage.length !== 1 ||
+            assistantMessage[0]?.role !== "assistant" ||
+            assistantMessage[0]?.turnId !== latestTurn.turnId ||
+            assistantMessage[0]?.streaming !== false ||
+            assistantMessage[0]?.text.trim().length === 0 ||
+            thread.messages.some(
+              (message) =>
+                message.role === "user" &&
+                Number.isFinite(Date.parse(message.createdAt)) &&
+                Date.parse(message.createdAt) > completedAtMs,
+            ) ||
+            threadShell.hasPendingApprovals ||
+            threadShell.hasPendingUserInput
+          ) {
+            return yield* new OrchestrationCommandInvariantError({
+              commandType: command.type,
+              detail: "Dora activity does not match a clean completed stopped Dora session.",
+            });
+          }
+          const pendingTurnStart = yield* getPendingTurnStart({ threadId: command.threadId }).pipe(
+            Effect.mapError(
+              (cause) =>
+                new OrchestrationCommandInvariantError({
+                  commandType: command.type,
+                  detail: "Dora stopped-session pending turn state is unavailable.",
+                  cause,
+                }),
+            ),
+          );
+          if (
+            Option.isSome(pendingTurnStart) ||
+            threadBackgroundLiveness.getThreadBackgroundLiveness(command.threadId) !== null
+          ) {
+            return yield* new OrchestrationCommandInvariantError({
+              commandType: command.type,
+              detail: "Dora activity does not match a clean completed stopped Dora session.",
+            });
+          }
+          return stampAtReceipt();
+        });
       }),
     );
   };
