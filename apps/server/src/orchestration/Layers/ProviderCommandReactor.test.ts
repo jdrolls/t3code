@@ -14,6 +14,7 @@ import {
 import { createModelSelection } from "@t3tools/shared/model";
 import {
   ApprovalRequestId,
+  CheckpointRef,
   CommandId,
   DEFAULT_PROVIDER_INTERACTION_MODE,
   EnvironmentId,
@@ -3865,10 +3866,18 @@ describe("ProviderCommandReactor", () => {
 
   effectIt.effect("stops a ready provider session after automatic settlement", () =>
     Effect.gen(function* () {
-      const sessionStopped = yield* Deferred.make<void>();
+      const stopStarted = yield* Deferred.make<void>();
+      const releaseStop = yield* Deferred.make<void>();
+      const threadId = ThreadId.make("thread-1");
+      const turnId = asTurnId("turn-auto-settle");
+      const messageId = asMessageId("assistant-message-auto-settle");
+      const providerSessionId = "Dora.Session:Opaque-Case_Sensitive.42";
       const harness = yield* Effect.promise(() =>
         createHarness({
-          stopSessionEffect: () => Deferred.succeed(sessionStopped, undefined).pipe(Effect.asVoid),
+          stopSessionEffect: () =>
+            Deferred.succeed(stopStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseStop)),
+            ),
         }),
       );
       const now = "2026-01-01T00:00:00.000Z";
@@ -3876,15 +3885,138 @@ describe("ProviderCommandReactor", () => {
       yield* harness.engine.dispatch({
         type: "thread.session.set",
         commandId: CommandId.make("cmd-session-set-for-auto-settle"),
-        threadId: ThreadId.make("thread-1"),
+        threadId,
         session: {
-          threadId: ThreadId.make("thread-1"),
+          threadId,
           status: "ready",
-          providerName: "codex",
-          providerInstanceId: ProviderInstanceId.make("codex_work"),
+          providerName: "dora",
+          providerInstanceId: ProviderInstanceId.make("dora-primary"),
+          providerSessionId,
           runtimeMode: "approval-required",
           activeTurnId: null,
           lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      });
+      yield* harness.engine.dispatch({
+        type: "thread.message.assistant.delta",
+        commandId: CommandId.make("cmd-assistant-message-for-auto-settle"),
+        threadId,
+        messageId,
+        turnId,
+        delta: "The completed response keeps its durable identity.",
+        createdAt: now,
+      });
+      yield* harness.engine.dispatch({
+        type: "thread.message.assistant.complete",
+        commandId: CommandId.make("cmd-assistant-message-complete-for-auto-settle"),
+        threadId,
+        messageId,
+        turnId,
+        createdAt: now,
+      });
+      yield* harness.engine.dispatch({
+        type: "thread.turn.diff.complete",
+        commandId: CommandId.make("cmd-turn-complete-for-auto-settle"),
+        threadId,
+        turnId,
+        completedAt: now,
+        checkpointRef: CheckpointRef.make("checkpoint-auto-settle"),
+        status: "missing",
+        files: [],
+        assistantMessageId: messageId,
+        checkpointTurnCount: 1,
+        createdAt: now,
+      });
+      const beforeSettlement = yield* Effect.promise(() => harness.readModel());
+
+      yield* harness.engine.dispatch({
+        type: "thread.auto-settle",
+        commandId: CommandId.make("cmd-auto-settle-with-session"),
+        threadId,
+        snapshotSequence: beforeSettlement.snapshotSequence,
+        settledAt: now,
+      });
+
+      yield* Deferred.await(stopStarted);
+      const whileStopIsPending = yield* Effect.promise(() => harness.readModel());
+      const pendingThread = whileStopIsPending.threads.find((entry) => entry.id === threadId);
+      expect(pendingThread?.settledOverride).toBe("settled");
+      expect(pendingThread?.session).toMatchObject({
+        status: "ready",
+        providerSessionId,
+      });
+
+      yield* harness.engine.dispatch({
+        type: "thread.session.stop",
+        commandId: CommandId.make("cmd-repeat-auto-settle-stop"),
+        threadId,
+        createdAt: now,
+        onlyIfSettled: true,
+      });
+      yield* Deferred.succeed(releaseStop, undefined);
+      yield* Effect.promise(() => harness.drain());
+
+      expect(harness.stopSession).toHaveBeenCalledTimes(1);
+      const readModel = yield* Effect.promise(() => harness.readModel());
+      const thread = readModel.threads.find((entry) => entry.id === threadId);
+      expect(thread?.settledOverride).toBe("settled");
+      expect(thread?.session).toMatchObject({
+        status: "stopped",
+        providerSessionId,
+      });
+      expect(thread?.latestTurn).toMatchObject({
+        turnId,
+        state: "completed",
+        completedAt: now,
+      });
+      expect(thread?.messages.find((message) => message.id === messageId)).toMatchObject({
+        text: "The completed response keeps its durable identity.",
+        streaming: false,
+        turnId,
+      });
+    }),
+  );
+
+  effectIt.effect("keeps a ready session and its error when delayed provider stop fails", () =>
+    Effect.gen(function* () {
+      const stopStarted = yield* Deferred.make<void>();
+      const releaseStop = yield* Deferred.make<void>();
+      const threadId = ThreadId.make("thread-1");
+      const providerSessionId = "Dora.Session:Opaque-Case_Sensitive.42";
+      const harness = yield* Effect.promise(() =>
+        createHarness({
+          stopSessionEffect: () =>
+            Deferred.succeed(stopStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseStop)),
+              Effect.andThen(
+                Effect.fail(
+                  new ProviderAdapterRequestError({
+                    provider: "dora",
+                    method: "session.stop",
+                    detail: "delayed provider stop failure",
+                  }),
+                ),
+              ),
+            ),
+        }),
+      );
+      const now = "2026-01-01T00:00:00.000Z";
+
+      yield* harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-set-for-delayed-stop-failure"),
+        threadId,
+        session: {
+          threadId,
+          status: "ready",
+          providerName: "dora",
+          providerInstanceId: ProviderInstanceId.make("dora-primary"),
+          providerSessionId,
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          lastError: "retain this projected error",
           updatedAt: now,
         },
         createdAt: now,
@@ -3893,19 +4025,39 @@ describe("ProviderCommandReactor", () => {
 
       yield* harness.engine.dispatch({
         type: "thread.auto-settle",
-        commandId: CommandId.make("cmd-auto-settle-with-session"),
-        threadId: ThreadId.make("thread-1"),
+        commandId: CommandId.make("cmd-auto-settle-delayed-stop-failure"),
+        threadId,
         snapshotSequence: beforeSettlement.snapshotSequence,
         settledAt: now,
       });
 
-      yield* Deferred.await(sessionStopped);
+      yield* Deferred.await(stopStarted);
+      const whileStopIsPending = yield* Effect.promise(() => harness.readModel());
+      expect(
+        whileStopIsPending.threads.find((entry) => entry.id === threadId)?.session,
+      ).toMatchObject({
+        status: "ready",
+        providerSessionId,
+        lastError: "retain this projected error",
+      });
+
+      yield* Deferred.succeed(releaseStop, undefined);
       yield* Effect.promise(() => harness.drain());
-      const readModel = yield* Effect.promise(() => harness.readModel());
-      const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
-      expect(thread?.settledOverride).toBe("settled");
-      expect(thread?.session?.status).toBe("stopped");
-      expect(thread?.session?.providerInstanceId).toBe(ProviderInstanceId.make("codex_work"));
+
+      const thread = (yield* Effect.promise(() => harness.readModel())).threads.find(
+        (entry) => entry.id === threadId,
+      );
+      expect(thread?.session).toMatchObject({
+        status: "ready",
+        providerSessionId,
+        lastError: "retain this projected error",
+      });
+      expect(thread?.activities).toContainEqual(
+        expect.objectContaining({
+          kind: "provider.session.stop.failed",
+          payload: { detail: "delayed provider stop failure" },
+        }),
+      );
     }),
   );
 });
