@@ -15,6 +15,9 @@ import {
   TurnId,
   type OrchestrationEvent,
   type OrchestrationReadModel,
+  type OrchestrationThread,
+  type OrchestrationThreadDetailSnapshot,
+  type OrchestrationThreadShell,
   ProviderInstanceId,
   ProviderSessionId,
 } from "@t3tools/contracts";
@@ -29,6 +32,7 @@ import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -86,7 +90,7 @@ function makeOrchestrationLayer(databasePath?: string) {
     Layer.provide(OrchestrationEventStoreLive),
     Layer.provideMerge(OrchestrationCommandReceiptRepositoryLive),
     Layer.provide(RepositoryIdentityResolver.layer),
-    Layer.provide(persistence),
+    Layer.provideMerge(persistence),
     Layer.provideMerge(ServerConfigLayer),
     Layer.provideMerge(NodeServices.layer),
   );
@@ -99,9 +103,24 @@ async function createOrchestrationSystem(databasePath?: string) {
   return {
     engine,
     readModel: () => runtime.runPromise(snapshotQuery.getSnapshot()),
+    commandReadModel: () => runtime.runPromise(snapshotQuery.getCommandReadModel()),
     readThread: (threadId: ThreadId) =>
       runtime.runPromise(snapshotQuery.getThreadDetailById(threadId)),
+    backgroundLiveness: () =>
+      runtime.runPromise(Effect.service(ThreadBackgroundLiveness.ThreadBackgroundLivenessService)),
     run: <A, E>(effect: Effect.Effect<A, E>) => runtime.runPromise(effect),
+    sql: () => {
+      if (databasePath === undefined) {
+        throw new Error("A database path is required for test SQL access.");
+      }
+      return runtime.runPromise(Effect.service(SqlClient.SqlClient));
+    },
+    runSql: <A, E>(effect: Effect.Effect<A, E, SqlClient.SqlClient>) => {
+      if (databasePath === undefined) {
+        throw new Error("A database path is required for test SQL access.");
+      }
+      return runtime.runPromise(effect);
+    },
     dispose: () => runtime.dispose(),
   };
 }
@@ -186,9 +205,77 @@ function makeDoraCommandReadModel(
   };
 }
 
+function makeStoppedDoraReadModel(snapshotSequence: number): OrchestrationReadModel {
+  const base = makeDoraCommandReadModel(snapshotSequence, "absent");
+  const threadId = ThreadId.make("thread-dora-reconciliation");
+  const providerInstanceId = ProviderInstanceId.make("dora");
+  const providerSessionId = ProviderSessionId.make("dora-session-reconciliation");
+  const turnId = TurnId.make("turn-dora-reconciliation");
+  const assistantMessageId = MessageId.make("assistant-dora-reconciliation");
+  const completedAt = "2026-01-01T00:00:01.000Z";
+
+  return {
+    ...base,
+    threads: [
+      {
+        ...base.threads[0]!,
+        latestTurn: {
+          turnId,
+          state: "completed",
+          requestedAt: now(),
+          startedAt: now(),
+          completedAt,
+          assistantMessageId,
+          requestMessageId: null,
+        },
+        messages: [
+          {
+            id: assistantMessageId,
+            role: "assistant",
+            text: "completed",
+            turnId,
+            streaming: false,
+            createdAt: completedAt,
+            updatedAt: completedAt,
+          },
+        ],
+        session: {
+          threadId,
+          status: "stopped",
+          providerName: "dora",
+          providerInstanceId,
+          providerSessionId,
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: completedAt,
+        },
+      },
+    ],
+  };
+}
+
+function makeStoppedDoraShell(thread: OrchestrationThread): OrchestrationThreadShell {
+  return {
+    ...thread,
+    latestUserMessageAt: null,
+    hasPendingApprovals: false,
+    hasPendingUserInput: false,
+    hasActionableProposedPlan: false,
+    backgroundLiveness: null,
+    planProgress: null,
+  };
+}
+
 function makeDoraReconciliationRuntime(
   commandReadModels: ReadonlyArray<OrchestrationReadModel>,
-  options?: { readonly reconciliationReadError?: PersistenceSqlError },
+  options?: {
+    readonly reconciliationReadError?: PersistenceSqlError;
+    readonly threadDetailSnapshot?: Option.Option<OrchestrationThreadDetailSnapshot>;
+    readonly threadDetailSnapshotError?: PersistenceSqlError;
+    readonly threadShell?: Option.Option<OrchestrationThreadShell>;
+    readonly threadShellError?: PersistenceSqlError;
+  },
 ) {
   let commandReadModelReads = 0;
   let appendCount = 0;
@@ -220,9 +307,19 @@ function makeDoraReconciliationRuntime(
     getFirstActiveThreadIdByProjectId: () => Effect.die("unused"),
     getThreadCheckpointContext: () => Effect.die("unused"),
     getFullThreadDiffContext: () => Effect.die("unused"),
-    getThreadShellById: () => Effect.die("unused"),
+    getThreadShellById: () =>
+      options?.threadShellError !== undefined
+        ? Effect.fail(options.threadShellError)
+        : options?.threadShell === undefined
+          ? Effect.die("unused")
+          : Effect.succeed(options.threadShell),
     getThreadDetailById: () => Effect.die("unused"),
-    getThreadDetailSnapshot: () => Effect.die("unused"),
+    getThreadDetailSnapshot: () =>
+      options?.threadDetailSnapshotError !== undefined
+        ? Effect.fail(options.threadDetailSnapshotError)
+        : options?.threadDetailSnapshot === undefined
+          ? Effect.die("unused")
+          : Effect.succeed(options.threadDetailSnapshot),
   };
   const eventStore: OrchestrationEventStoreShape = {
     append: (event) =>
@@ -748,6 +845,505 @@ describe("OrchestrationEngine", () => {
           expect(readFailure.appendCount()).toBe(0);
         } finally {
           await readFailure.runtime.dispose();
+        }
+      }),
+  );
+
+  effectIt.effect("binds stopped Dora closure evidence to the current command model", () =>
+    Effect.promise(async () => {
+      const current = makeStoppedDoraReadModel(8);
+      const thread = current.threads[0]!;
+      const capability = createAuthenticatedDoraActivityCapability({
+        threadId: thread.id,
+        providerInstanceId: ProviderInstanceId.make("dora"),
+        providerSessionId: ProviderSessionId.make("dora-session-reconciliation"),
+      });
+      const command = (commandId: string) => ({
+        type: "thread.activity.append" as const,
+        commandId: CommandId.make(commandId),
+        threadId: thread.id,
+        providerInstanceId: ProviderInstanceId.make("dora"),
+        providerSessionId: ProviderSessionId.make("dora-session-reconciliation"),
+        activity: {
+          id: EventId.make(`activity-${commandId}`),
+          tone: "info" as const,
+          kind: "dora.verification" as const,
+          summary: "Verified",
+          payload: {},
+          turnId: null,
+          createdAt: now(),
+        },
+        createdAt: now(),
+      });
+      const shell = makeStoppedDoraShell(thread);
+      const cases: ReadonlyArray<{
+        readonly name: string;
+        readonly detail: Option.Option<OrchestrationThreadDetailSnapshot>;
+        readonly shell: Option.Option<OrchestrationThreadShell>;
+        readonly accepted: boolean;
+      }> = [
+        {
+          name: "accepts unrelated higher projection sequence",
+          detail: Option.some({ snapshotSequence: 9, thread }),
+          shell: Option.some(shell),
+          accepted: true,
+        },
+        {
+          name: "rejects a lower projection sequence",
+          detail: Option.some({ snapshotSequence: 7, thread }),
+          shell: Option.some(shell),
+          accepted: false,
+        },
+        {
+          name: "rejects missing detail",
+          detail: Option.none(),
+          shell: Option.some(shell),
+          accepted: false,
+        },
+        {
+          name: "rejects missing shell",
+          detail: Option.some({ snapshotSequence: 9, thread }),
+          shell: Option.none(),
+          accepted: false,
+        },
+        {
+          name: "rejects a foreign assistant proof",
+          detail: Option.some({
+            snapshotSequence: 9,
+            thread: {
+              ...thread,
+              latestTurn: { ...thread.latestTurn!, assistantMessageId: MessageId.make("foreign") },
+            },
+          }),
+          shell: Option.some(shell),
+          accepted: false,
+        },
+        {
+          name: "rejects missing assistant proof",
+          detail: Option.some({ snapshotSequence: 9, thread: { ...thread, messages: [] } }),
+          shell: Option.some(shell),
+          accepted: false,
+        },
+        {
+          name: "rejects malformed completion time",
+          detail: Option.some({
+            snapshotSequence: 9,
+            thread: { ...thread, latestTurn: { ...thread.latestTurn!, completedAt: "invalid" } },
+          }),
+          shell: Option.some(shell),
+          accepted: false,
+        },
+        {
+          name: "rejects a later user message",
+          detail: Option.some({
+            snapshotSequence: 9,
+            thread: {
+              ...thread,
+              messages: [
+                ...thread.messages,
+                {
+                  id: MessageId.make("later-user"),
+                  role: "user",
+                  text: "new work",
+                  turnId: null,
+                  streaming: false,
+                  createdAt: "2026-01-01T00:00:02.000Z",
+                  updatedAt: "2026-01-01T00:00:02.000Z",
+                },
+              ],
+            },
+          }),
+          shell: Option.some(shell),
+          accepted: false,
+        },
+        {
+          name: "rejects pending approval",
+          detail: Option.some({ snapshotSequence: 9, thread }),
+          shell: Option.some({ ...shell, hasPendingApprovals: true }),
+          accepted: false,
+        },
+      ];
+
+      for (const testCase of cases) {
+        const runtime = makeDoraReconciliationRuntime([current], {
+          threadDetailSnapshot: testCase.detail,
+          threadShell: testCase.shell,
+        });
+        try {
+          const engine = await runtime.runtime.runPromise(
+            Effect.service(OrchestrationEngineService),
+          );
+          if (testCase.accepted) {
+            await runtime.runtime.runPromise(
+              engine.dispatch(command(`cmd-stopped-evidence-${testCase.name}`), {
+                doraActivityCapability: capability,
+              }),
+            );
+            expect(runtime.appendCount()).toBe(1);
+          } else {
+            await expect(
+              runtime.runtime.runPromise(
+                engine.dispatch(command(`cmd-stopped-evidence-${testCase.name}`), {
+                  doraActivityCapability: capability,
+                }),
+              ),
+            ).rejects.toThrow("clean completed stopped Dora session");
+            expect(runtime.appendCount()).toBe(0);
+          }
+        } finally {
+          await runtime.runtime.dispose();
+        }
+      }
+    }),
+  );
+
+  effectIt.effect(
+    "rejects every remaining stopped Dora closure proof mismatch without appending",
+    () =>
+      Effect.promise(async () => {
+        const current = makeStoppedDoraReadModel(8);
+        const thread = current.threads[0]!;
+        const capability = createAuthenticatedDoraActivityCapability({
+          threadId: thread.id,
+          providerInstanceId: ProviderInstanceId.make("dora"),
+          providerSessionId: ProviderSessionId.make("dora-session-reconciliation"),
+        });
+        const command = (
+          commandId: string,
+          kind:
+            | "dora.plan"
+            | "dora.replan"
+            | "dora.verification"
+            | "dora.side-effect" = "dora.verification",
+          payload: Record<string, unknown> = {},
+        ) => ({
+          type: "thread.activity.append" as const,
+          commandId: CommandId.make(commandId),
+          threadId: thread.id,
+          providerInstanceId: ProviderInstanceId.make("dora"),
+          providerSessionId: ProviderSessionId.make("dora-session-reconciliation"),
+          activity: {
+            id: EventId.make(`activity-${commandId}`),
+            tone: "info" as const,
+            kind,
+            summary: "Verified",
+            payload,
+            turnId: null,
+            createdAt: now(),
+          },
+          createdAt: now(),
+        });
+        const all = (nextThread: OrchestrationThread, snapshotSequence = 9) => ({
+          current: { ...current, threads: [nextThread] },
+          detail: Option.some({ snapshotSequence, thread: nextThread }),
+          shell: Option.some(makeStoppedDoraShell(nextThread)),
+        });
+        const detailOnly = (nextThread: OrchestrationThread, snapshotSequence = 9) => ({
+          current,
+          detail: Option.some({ snapshotSequence, thread: nextThread }),
+          shell: Option.some(makeStoppedDoraShell(nextThread)),
+        });
+        const withoutProviderSessionId = (candidate: OrchestrationThread): OrchestrationThread => {
+          const { providerSessionId: _providerSessionId, ...session } = candidate.session!;
+          return { ...candidate, session };
+        };
+        const withLatestTurn = (
+          candidate: OrchestrationThread,
+          turn: NonNullable<OrchestrationThread["latestTurn"]>,
+          messages = candidate.messages,
+        ): OrchestrationThread => ({ ...candidate, latestTurn: turn, messages });
+        const cases: ReadonlyArray<{
+          readonly name: string;
+          readonly current: OrchestrationReadModel;
+          readonly detail?: Option.Option<OrchestrationThreadDetailSnapshot>;
+          readonly shell?: Option.Option<OrchestrationThreadShell>;
+          readonly threadDetailSnapshotError?: PersistenceSqlError;
+          readonly threadShellError?: PersistenceSqlError;
+          readonly kind?: "dora.plan" | "dora.replan" | "dora.verification" | "dora.side-effect";
+          readonly payload?: Record<string, unknown>;
+          readonly accepted?: boolean;
+        }> = [
+          {
+            name: "accepts ready current binding despite stale stopped detail",
+            current: {
+              ...current,
+              threads: [{ ...thread, session: { ...thread.session!, status: "ready" } }],
+            },
+            detail: Option.some({ snapshotSequence: 9, thread }),
+            shell: Option.some(makeStoppedDoraShell(thread)),
+            accepted: true,
+          },
+          {
+            name: "accepts running current binding despite stale stopped detail",
+            current: makeDoraCommandReadModel(8, "bound"),
+            detail: Option.some({ snapshotSequence: 9, thread }),
+            shell: Option.some(makeStoppedDoraShell(thread)),
+            accepted: true,
+          },
+          {
+            name: "rejects missing explicit provider session identity",
+            ...all(withoutProviderSessionId(thread)),
+          },
+          {
+            name: "rejects foreign provider session identity",
+            ...all({
+              ...thread,
+              session: {
+                ...thread.session!,
+                providerSessionId: ProviderSessionId.make("foreign-dora-session"),
+              },
+            }),
+          },
+          {
+            name: "rejects foreign provider instance identity",
+            ...all({
+              ...thread,
+              session: {
+                ...thread.session!,
+                providerInstanceId: ProviderInstanceId.make("foreign-dora"),
+              },
+            }),
+          },
+          {
+            name: "rejects foreign provider name",
+            ...all({ ...thread, session: { ...thread.session!, providerName: "codex" } }),
+          },
+          {
+            name: "rejects foreign detail thread",
+            ...detailOnly({
+              ...thread,
+              id: ThreadId.make("foreign-dora-thread"),
+              session: { ...thread.session!, threadId: ThreadId.make("foreign-dora-thread") },
+            }),
+          },
+          {
+            name: "rejects foreign detail project",
+            ...detailOnly({ ...thread, projectId: ProjectId.make("foreign-dora-project") }),
+          },
+          {
+            name: "rejects an archived current thread",
+            current: {
+              ...current,
+              threads: [{ ...thread, archivedAt: "2026-01-01T00:00:02.000Z" }],
+            },
+            detail: Option.some({ snapshotSequence: 9, thread }),
+            shell: Option.some(makeStoppedDoraShell(thread)),
+          },
+          {
+            name: "rejects an archived detail thread",
+            ...detailOnly({ ...thread, archivedAt: "2026-01-01T00:00:02.000Z" }),
+          },
+          {
+            name: "rejects a deleted current thread",
+            current: {
+              ...current,
+              threads: [{ ...thread, deletedAt: "2026-01-01T00:00:02.000Z" }],
+            },
+            detail: Option.some({ snapshotSequence: 9, thread }),
+            shell: Option.some(makeStoppedDoraShell(thread)),
+          },
+          {
+            name: "rejects a deleted detail thread",
+            ...detailOnly({ ...thread, deletedAt: "2026-01-01T00:00:02.000Z" }),
+          },
+          {
+            name: "rejects an exact shell turn mismatch",
+            current,
+            detail: Option.some({ snapshotSequence: 9, thread }),
+            shell: Option.some({
+              ...makeStoppedDoraShell(thread),
+              latestTurn: { ...thread.latestTurn!, turnId: TurnId.make("shell-different-turn") },
+            }),
+          },
+          {
+            name: "rejects an active turn",
+            ...all({
+              ...thread,
+              session: { ...thread.session!, activeTurnId: TurnId.make("active-dora-turn") },
+            }),
+          },
+          {
+            name: "rejects a terminal error",
+            ...all({ ...thread, session: { ...thread.session!, lastError: "provider failed" } }),
+          },
+          {
+            name: "rejects a starting session",
+            ...all({ ...thread, session: { ...thread.session!, status: "starting" } }),
+          },
+          {
+            name: "rejects an error session",
+            ...all({ ...thread, session: { ...thread.session!, status: "error" } }),
+          },
+          {
+            name: "rejects a newer contradictory current turn",
+            current: {
+              ...current,
+              snapshotSequence: 10,
+              threads: [
+                withLatestTurn(thread, {
+                  ...thread.latestTurn!,
+                  turnId: TurnId.make("current-newer"),
+                }),
+              ],
+            },
+            detail: Option.some({ snapshotSequence: 10, thread }),
+            shell: Option.some(makeStoppedDoraShell(thread)),
+          },
+          {
+            name: "rejects a missing latest turn",
+            ...all({ ...thread, latestTurn: null }),
+          },
+          {
+            name: "rejects an interrupted latest turn",
+            ...all(withLatestTurn(thread, { ...thread.latestTurn!, state: "interrupted" })),
+          },
+          {
+            name: "rejects an errored latest turn",
+            ...all(withLatestTurn(thread, { ...thread.latestTurn!, state: "error" })),
+          },
+          {
+            name: "rejects a different detail turn",
+            ...detailOnly(
+              withLatestTurn(
+                thread,
+                { ...thread.latestTurn!, turnId: TurnId.make("foreign-completed-turn") },
+                [{ ...thread.messages[0]!, turnId: TurnId.make("foreign-completed-turn") }],
+              ),
+            ),
+          },
+          {
+            name: "rejects a missing assistant id",
+            ...all(withLatestTurn(thread, { ...thread.latestTurn!, assistantMessageId: null })),
+          },
+          {
+            name: "rejects a different assistant id",
+            ...detailOnly(
+              withLatestTurn(
+                thread,
+                { ...thread.latestTurn!, assistantMessageId: MessageId.make("foreign-assistant") },
+                [{ ...thread.messages[0]!, id: MessageId.make("foreign-assistant") }],
+              ),
+            ),
+          },
+          {
+            name: "rejects a null completed time",
+            ...all(withLatestTurn(thread, { ...thread.latestTurn!, completedAt: null })),
+          },
+          {
+            name: "rejects an invalid completed time consistently",
+            ...all(withLatestTurn(thread, { ...thread.latestTurn!, completedAt: "invalid" })),
+          },
+          {
+            name: "rejects duplicate matching terminal assistants",
+            ...all({ ...thread, messages: [...thread.messages, { ...thread.messages[0]! }] }),
+          },
+          {
+            name: "rejects a non-assistant terminal message",
+            ...all({ ...thread, messages: [{ ...thread.messages[0]!, role: "system" }] }),
+          },
+          {
+            name: "rejects a terminal assistant from another turn",
+            ...all({
+              ...thread,
+              messages: [{ ...thread.messages[0]!, turnId: TurnId.make("other-assistant-turn") }],
+            }),
+          },
+          {
+            name: "rejects a streaming terminal assistant",
+            ...all({ ...thread, messages: [{ ...thread.messages[0]!, streaming: true }] }),
+          },
+          {
+            name: "rejects whitespace-only terminal assistant text",
+            ...all({ ...thread, messages: [{ ...thread.messages[0]!, text: "   " }] }),
+          },
+          {
+            name: "rejects pending user input",
+            ...all(thread),
+            shell: Option.some({ ...makeStoppedDoraShell(thread), hasPendingUserInput: true }),
+          },
+          {
+            name: "rejects a negative detail sequence",
+            ...all(thread, -1),
+          },
+          {
+            name: "rejects a non-safe detail sequence",
+            ...all(thread, Number.MAX_SAFE_INTEGER + 1),
+          },
+          {
+            name: "rejects an unavailable detail query",
+            current,
+            threadDetailSnapshotError: new PersistenceSqlError({
+              operation: "test.dora-stopped-detail",
+              detail: "detail unavailable",
+            }),
+            shell: Option.some(makeStoppedDoraShell(thread)),
+          },
+          {
+            name: "rejects an unavailable shell query",
+            current,
+            detail: Option.some({ snapshotSequence: 9, thread }),
+            threadShellError: new PersistenceSqlError({
+              operation: "test.dora-stopped-shell",
+              detail: "shell unavailable",
+            }),
+          },
+          {
+            name: "rejects stopped dora plan",
+            ...all(thread),
+            kind: "dora.plan",
+          },
+          {
+            name: "rejects stopped dora replan",
+            ...all(thread),
+            kind: "dora.replan",
+          },
+          {
+            name: "rejects stopped time-gate comment",
+            ...all(thread),
+            kind: "dora.side-effect",
+            payload: { kind: "time-gate-comment" },
+          },
+          {
+            name: "rejects stopped follow-up side effect",
+            ...all(thread),
+            kind: "dora.side-effect",
+            payload: { kind: "follow-up" },
+          },
+        ];
+
+        for (const testCase of cases) {
+          const runtime = makeDoraReconciliationRuntime([testCase.current], {
+            ...(testCase.detail === undefined ? {} : { threadDetailSnapshot: testCase.detail }),
+            ...(testCase.shell === undefined ? {} : { threadShell: testCase.shell }),
+            ...(testCase.threadDetailSnapshotError === undefined
+              ? {}
+              : { threadDetailSnapshotError: testCase.threadDetailSnapshotError }),
+            ...(testCase.threadShellError === undefined
+              ? {}
+              : { threadShellError: testCase.threadShellError }),
+          });
+          try {
+            const engine = await runtime.runtime.runPromise(
+              Effect.service(OrchestrationEngineService),
+            );
+            const dispatch = runtime.runtime.runPromise(
+              engine.dispatch(
+                command(`cmd-stopped-matrix-${testCase.name}`, testCase.kind, testCase.payload),
+                {
+                  doraActivityCapability: capability,
+                },
+              ),
+            );
+            if (testCase.accepted === true) {
+              await dispatch;
+              expect(runtime.appendCount()).toBe(1);
+            } else {
+              await expect(dispatch).rejects.toThrow();
+              expect(runtime.appendCount()).toBe(0);
+            }
+          } finally {
+            await runtime.runtime.dispose();
+          }
         }
       }),
   );
@@ -3034,6 +3630,350 @@ describe("OrchestrationEngine", () => {
           ).rejects.toThrow("maximum depth");
         } finally {
           await system.dispose();
+        }
+      }),
+  );
+
+  effectIt.effect(
+    "allows a clean stopped completed Dora session to finish closure activity and settle",
+    () =>
+      Effect.promise(async () => {
+        const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-dora-closure-"));
+        const databasePath = NodePath.join(directory, "state.sqlite");
+        let system = await createOrchestrationSystem(databasePath);
+        const { engine } = system;
+        const projectId = ProjectId.make("dora-backlog-ralph-trades-v3-20260907");
+        const threadId = ThreadId.make("dora-thread-jdrolls/ralph-trades-v3-1678");
+        const providerInstanceId = ProviderInstanceId.make("dora_canary");
+        const providerSessionId = ProviderSessionId.make("ses_f83eff670ffeHGH74jVw3Pfk6i");
+        const turnId = TurnId.make("dora-turn-1788862407846-76");
+        const assistantMessageId = MessageId.make("assistant:dora-turn-1788862407846-76");
+        const completedAt = "2026-09-08T10:16:12.719Z";
+        const capability = createAuthenticatedDoraActivityCapability({
+          threadId,
+          providerInstanceId,
+          providerSessionId,
+        });
+        const appendActivity = (
+          commandId: string,
+          kind: "dora.verification" | "dora.side-effect",
+          payload: Record<string, unknown>,
+        ) =>
+          system.engine.dispatch(
+            {
+              type: "thread.activity.append",
+              commandId: CommandId.make(commandId),
+              threadId,
+              providerInstanceId,
+              providerSessionId,
+              activity: {
+                id: EventId.make(`activity-${commandId}`),
+                tone: "info",
+                kind,
+                summary: `${kind} completed`,
+                payload,
+                turnId: null,
+                createdAt: now(),
+              },
+              createdAt: now(),
+            },
+            { doraActivityCapability: capability },
+          );
+        try {
+          await system.run(
+            engine.dispatch({
+              type: "project.create",
+              commandId: CommandId.make("cmd-stopped-dora-project"),
+              projectId,
+              title: "Dora project",
+              workspaceRoot: "/tmp/dora-stopped-original1678",
+              createdAt: now(),
+            }),
+          );
+          await system.run(
+            engine.dispatch({
+              type: "thread.create",
+              commandId: CommandId.make("cmd-stopped-dora-thread"),
+              threadId,
+              projectId,
+              title: "Dora original 1678",
+              modelSelection: { instanceId: providerInstanceId, model: "default" },
+              runtimeMode: "auto",
+              interactionMode: "default",
+              branch: "main",
+              worktreePath: "/tmp/dora-stopped-original1678",
+              createdAt: now(),
+            }),
+          );
+          await system.run(
+            engine.dispatch({
+              type: "thread.turn.start",
+              commandId: CommandId.make("cmd-stopped-dora-turn"),
+              threadId,
+              message: {
+                messageId: MessageId.make(
+                  "dora-message-retry-3-6c1552aaa92d81e192eeae0f1980e42a-jdrolls/ralph-trades-v3-1678",
+                ),
+                role: "user",
+                text: "Verify original 1678",
+                attachments: [],
+              },
+              interactionMode: "default",
+              runtimeMode: "auto",
+              createdAt: completedAt,
+            }),
+          );
+          await system.run(
+            engine.dispatch({
+              type: "thread.session.set",
+              commandId: CommandId.make("cmd-stopped-dora-running"),
+              threadId,
+              createdAt: completedAt,
+              session: {
+                threadId,
+                status: "running",
+                providerName: "dora",
+                providerInstanceId,
+                providerSessionId,
+                runtimeMode: "auto",
+                activeTurnId: turnId,
+                lastError: null,
+                updatedAt: completedAt,
+              },
+            }),
+          );
+          await system.run(
+            engine.dispatch({
+              type: "thread.message.assistant.delta",
+              commandId: CommandId.make("cmd-stopped-dora-assistant-delta"),
+              threadId,
+              messageId: assistantMessageId,
+              turnId,
+              delta: '{"verdict":"pass"}',
+              createdAt: completedAt,
+            }),
+          );
+          await system.run(
+            engine.dispatch({
+              type: "thread.message.assistant.complete",
+              commandId: CommandId.make("cmd-stopped-dora-assistant-complete"),
+              threadId,
+              messageId: assistantMessageId,
+              turnId,
+              createdAt: completedAt,
+            }),
+          );
+          await system.run(
+            engine.dispatch({
+              type: "thread.session.set",
+              commandId: CommandId.make("cmd-stopped-dora-ready"),
+              threadId,
+              createdAt: completedAt,
+              session: {
+                threadId,
+                status: "ready",
+                providerName: "dora",
+                providerInstanceId,
+                providerSessionId,
+                runtimeMode: "auto",
+                activeTurnId: null,
+                lastError: null,
+                updatedAt: completedAt,
+              },
+            }),
+          );
+          await system.run(
+            engine.dispatch({
+              type: "thread.session.set",
+              commandId: CommandId.make("cmd-stopped-dora-terminal"),
+              threadId,
+              createdAt: "2026-09-08T10:46:30.434Z",
+              session: {
+                threadId,
+                status: "stopped",
+                providerName: "dora",
+                providerInstanceId,
+                providerSessionId,
+                runtimeMode: "auto",
+                activeTurnId: null,
+                lastError: null,
+                updatedAt: "2026-09-08T10:46:30.434Z",
+              },
+            }),
+          );
+          const beforeClosure = await system.readThread(threadId);
+          expect(Option.getOrThrow(beforeClosure)).toMatchObject({
+            latestTurn: {
+              turnId,
+              state: "completed",
+              completedAt,
+              assistantMessageId,
+            },
+            session: {
+              status: "stopped",
+              providerName: "dora",
+              providerInstanceId,
+              providerSessionId,
+              activeTurnId: null,
+              lastError: null,
+            },
+          });
+
+          await system.dispose();
+          system = await createOrchestrationSystem(databasePath);
+          const coldCommandThread = (await system.commandReadModel()).threads.find(
+            (thread) => thread.id === threadId,
+          );
+          expect(coldCommandThread).toMatchObject({
+            latestTurn: { turnId, state: "completed", completedAt, assistantMessageId },
+            session: {
+              status: "stopped",
+              providerName: "dora",
+              providerInstanceId,
+              providerSessionId,
+              activeTurnId: null,
+              lastError: null,
+            },
+            messages: [],
+            activities: [],
+          });
+
+          await expect(
+            system.run(
+              appendActivity("cmd-stopped-dora-time-gate", "dora.side-effect", {
+                kind: "time-gate-comment",
+              }),
+            ),
+          ).rejects.toThrow("active bound Dora session");
+          const sql = await system.sql();
+          await system.runSql(sql`
+            INSERT INTO projection_turns (
+              thread_id,
+              turn_id,
+              pending_message_id,
+              source_proposed_plan_thread_id,
+              source_proposed_plan_id,
+              assistant_message_id,
+              state,
+              requested_at,
+              started_at,
+              completed_at,
+              checkpoint_turn_count,
+              checkpoint_ref,
+              checkpoint_status,
+              checkpoint_files_json
+            )
+            VALUES (
+              ${threadId},
+              NULL,
+              ${MessageId.make("queued-stopped-dora-message")},
+              NULL,
+              NULL,
+              NULL,
+              'pending',
+              ${now()},
+              NULL,
+              NULL,
+              NULL,
+              NULL,
+              NULL,
+              '[]'
+            )
+          `);
+          expect(Option.getOrThrow(await system.readThread(threadId)).latestTurn).toMatchObject({
+            state: "completed",
+            completedAt,
+          });
+          await expect(
+            system.run(appendActivity("cmd-stopped-dora-queued", "dora.verification", {})),
+          ).rejects.toThrow("clean completed stopped Dora session");
+          await system.runSql(sql`
+            DELETE FROM projection_turns
+            WHERE thread_id = ${threadId}
+              AND turn_id IS NULL
+              AND state = 'pending'
+          `);
+          const backgroundLiveness = await system.backgroundLiveness();
+          backgroundLiveness.recordTaskLiveness({
+            threadId,
+            taskId: "stopped-dora-live-task",
+            taskType: "subagent",
+            status: undefined,
+            kind: "started",
+          });
+          await expect(
+            system.run(appendActivity("cmd-stopped-dora-live", "dora.verification", {})),
+          ).rejects.toThrow("clean completed stopped Dora session");
+          backgroundLiveness.clearThreadLiveness(threadId);
+          await system.run(
+            appendActivity("cmd-stopped-dora-verification", "dora.verification", {}),
+          );
+          await system.run(
+            appendActivity("cmd-stopped-dora-deployment", "dora.side-effect", {
+              kind: "deployment",
+            }),
+          );
+          const closeIssue = await system.run(
+            appendActivity("cmd-stopped-dora-close-issue", "dora.side-effect", {
+              kind: "close-issue",
+            }),
+          );
+          await system.run(
+            system.engine.dispatch({
+              type: "thread.settle",
+              commandId: CommandId.make("cmd-stopped-dora-settle"),
+              threadId,
+              expectedSnapshotSequence: closeIssue.sequence,
+            }),
+          );
+          const afterClosure = Option.getOrThrow(await system.readThread(threadId));
+          expect(afterClosure).toMatchObject({
+            settledOverride: "settled",
+            latestTurn: {
+              turnId,
+              state: "completed",
+              completedAt,
+              assistantMessageId,
+            },
+            session: {
+              status: "stopped",
+              providerName: "dora",
+              providerInstanceId,
+              providerSessionId,
+              activeTurnId: null,
+              lastError: null,
+            },
+          });
+          await system.run(
+            appendActivity("cmd-stopped-dora-repeat-verification", "dora.verification", {}),
+          );
+          await system.run(
+            system.engine.dispatch({
+              type: "thread.session.set",
+              commandId: CommandId.make("cmd-stopped-dora-revoked"),
+              threadId,
+              createdAt: "2026-09-08T10:46:31.000Z",
+              session: {
+                threadId,
+                status: "error",
+                providerName: "dora",
+                providerInstanceId,
+                providerSessionId,
+                runtimeMode: "auto",
+                activeTurnId: null,
+                lastError: "provider failed after closure",
+                updatedAt: "2026-09-08T10:46:31.000Z",
+              },
+            }),
+          );
+          await expect(
+            system.run(
+              appendActivity("cmd-stopped-dora-revoked-activity", "dora.verification", {}),
+            ),
+          ).rejects.toThrow("clean completed stopped Dora session");
+        } finally {
+          await system.dispose();
+          await NodeFSP.rm(directory, { recursive: true, force: true });
         }
       }),
   );

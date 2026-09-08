@@ -1,4 +1,4 @@
-export declare const RELEASE_VERSION: "0.0.40-fork.8";
+export declare const RELEASE_VERSION: "0.0.40-fork.9";
 export declare const FORK_REPOSITORY_URL: "https://github.com/jdrolls/t3code";
 
 export interface SourcePackage {
