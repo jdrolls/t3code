@@ -90,7 +90,7 @@ function makeOrchestrationLayer(databasePath?: string) {
     Layer.provide(OrchestrationEventStoreLive),
     Layer.provideMerge(OrchestrationCommandReceiptRepositoryLive),
     Layer.provide(RepositoryIdentityResolver.layer),
-    Layer.provide(persistence),
+    Layer.provideMerge(persistence),
     Layer.provideMerge(ServerConfigLayer),
     Layer.provideMerge(NodeServices.layer),
   );
@@ -98,12 +98,6 @@ function makeOrchestrationLayer(databasePath?: string) {
 
 async function createOrchestrationSystem(databasePath?: string) {
   const runtime = ManagedRuntime.make(makeOrchestrationLayer(databasePath));
-  const sqlRuntime =
-    databasePath === undefined
-      ? undefined
-      : ManagedRuntime.make(
-          makeSqlitePersistenceLive(databasePath).pipe(Layer.provideMerge(NodeServices.layer)),
-        );
   const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
   const snapshotQuery = await runtime.runPromise(Effect.service(ProjectionSnapshotQuery));
   return {
@@ -116,21 +110,18 @@ async function createOrchestrationSystem(databasePath?: string) {
       runtime.runPromise(Effect.service(ThreadBackgroundLiveness.ThreadBackgroundLivenessService)),
     run: <A, E>(effect: Effect.Effect<A, E>) => runtime.runPromise(effect),
     sql: () => {
-      if (sqlRuntime === undefined) {
+      if (databasePath === undefined) {
         throw new Error("A database path is required for test SQL access.");
       }
-      return sqlRuntime.runPromise(Effect.service(SqlClient.SqlClient));
+      return runtime.runPromise(Effect.service(SqlClient.SqlClient));
     },
     runSql: <A, E>(effect: Effect.Effect<A, E, SqlClient.SqlClient>) => {
-      if (sqlRuntime === undefined) {
+      if (databasePath === undefined) {
         throw new Error("A database path is required for test SQL access.");
       }
-      return sqlRuntime.runPromise(effect);
+      return runtime.runPromise(effect);
     },
-    dispose: async () => {
-      await runtime.dispose();
-      await sqlRuntime?.dispose();
-    },
+    dispose: () => runtime.dispose(),
   };
 }
 
