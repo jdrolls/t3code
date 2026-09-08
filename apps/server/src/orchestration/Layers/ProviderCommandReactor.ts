@@ -1668,6 +1668,9 @@ const make = Effect.gen(function* () {
               ...(thread.session?.providerInstanceId !== undefined
                 ? { providerInstanceId: thread.session.providerInstanceId }
                 : {}),
+              ...(thread.session?.providerSessionId !== undefined
+                ? { providerSessionId: thread.session.providerSessionId }
+                : {}),
               runtimeMode: thread.session?.runtimeMode ?? DEFAULT_RUNTIME_MODE,
               activeTurnId: null,
               lastError: thread.session?.lastError ?? null,
